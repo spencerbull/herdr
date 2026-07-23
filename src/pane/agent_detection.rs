@@ -316,6 +316,14 @@ pub(super) fn detection_update_for_publish_with_osc(
     (!detection.skip_state_update).then_some(detection)
 }
 
+pub(super) fn should_skip_detection_update(
+    agent: Option<Agent>,
+    content: &str,
+    process_exited: bool,
+) -> bool {
+    !process_exited && crate::detect::should_skip_state_update(agent, content)
+}
+
 pub(super) fn observe_detection_content_change(bytes: &[u8], detection_content_seq: &AtomicU64) {
     if !bytes.is_empty() {
         detection_content_seq.fetch_add(1, Ordering::Relaxed);
@@ -552,5 +560,21 @@ mod tests {
         mark_detection_content_changed(&seq);
 
         assert_eq!(seq.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn process_exit_overrides_a_manifest_skip_rule() {
+        let content = "⏺ Ran command\n  └ Exited with code 0";
+
+        assert!(should_skip_detection_update(
+            Some(Agent::Devin),
+            content,
+            false
+        ));
+        assert!(!should_skip_detection_update(
+            Some(Agent::Devin),
+            content,
+            true
+        ));
     }
 }

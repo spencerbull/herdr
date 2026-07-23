@@ -344,6 +344,20 @@ fn devin_manifest_detects_idle_working_and_blocked_states() {
     assert_eq!(working.state, AgentState::Working);
     assert!(working.visible_working);
 
+    let transient_between_steps = explain(
+        Agent::Devin,
+        "⏺ Ran command\n  │ $ cargo test\n  └ Exited with code 0",
+    );
+    assert_eq!(transient_between_steps.state, AgentState::Unknown);
+    assert!(transient_between_steps.skip_state_update);
+    assert_eq!(
+        transient_between_steps
+            .matched_rule
+            .as_ref()
+            .map(|rule| rule.id.as_str()),
+        Some("completed_tool_step")
+    );
+
     let trust_prompt = explain(
         Agent::Devin,
         "Do you trust the authors of this directory?\nFor security, devin should not be run in directories\nwith untrusted content.\n❭ 1 Yes, trust /private/tmp/devin-hook-probe\n· 2 No, exit",
@@ -357,6 +371,20 @@ fn devin_manifest_detects_idle_working_and_blocked_states() {
     );
     assert_eq!(permission_prompt.state, AgentState::Blocked);
     assert!(permission_prompt.visible_blocker);
+
+    let structured_question = explain(
+        Agent::Devin,
+        "── Direction · Preserve ───────────────────────────\nWhat design direction for the crafted 6-pager?\n❭ 1 Dark editorial\n· 2 Light editorial\n· 3 Light body, dark hero moments\n↑↓ navigate · ↵ select · e select+type · ←→ switch question · esc cancel",
+    );
+    assert_eq!(structured_question.state, AgentState::Blocked);
+    assert!(structured_question.visible_blocker);
+    assert_eq!(
+        structured_question
+            .matched_rule
+            .as_ref()
+            .map(|rule| rule.id.as_str()),
+        Some("structured_question_prompt")
+    );
 }
 
 #[test]

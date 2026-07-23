@@ -1,7 +1,7 @@
 id = "devin"
-version = "2026.06.15.1"
+version = "2026.07.23.1"
 min_engine_version = 1
-updated_at = "2026-06-15T00:00:00Z"
+updated_at = "2026-07-23T00:00:00Z"
 aliases = ["devin-cli", "devin cli"]
 
 [[rules]]
@@ -23,6 +23,14 @@ priority = 290
 region = "bottom_non_empty_lines(8)"
 visible_blocker = true
 contains = ["approve once", "select", "confirm", "esc cancel"]
+
+[[rules]]
+id = "structured_question_prompt"
+state = "blocked"
+priority = 280
+region = "bottom_non_empty_lines(8)"
+visible_blocker = true
+contains = ["navigate", "select+type", "esc cancel"]
 
 [[rules]]
 id = "running_tools_footer"
@@ -84,3 +92,13 @@ not = [
   { contains = ["running tools", "esc to interrupt"] },
   { contains = ["guide devin while it works"] },
 ]
+
+# Devin briefly clears its working footer after rendering a tool result.
+# Preserve the previous state until the next explicit state UI appears.
+[[rules]]
+id = "completed_tool_step"
+state = "unknown"
+priority = 10
+region = "bottom_non_empty_lines(8)"
+skip_state_update = true
+line_regex = ['^\s*⏺\s+']
