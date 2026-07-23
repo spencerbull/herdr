@@ -36,9 +36,9 @@ mod xtgettcap;
 use self::agent_detection::{
     decide_detection_screen_read, decide_screen_detection_publish,
     detection_update_for_publish_with_osc, mark_detection_content_changed,
-    observe_detection_content_change, DetectionPublishDecision, DetectionScreenReadDecision,
-    DetectionScreenReadInput, PendingIdleConfirmation, ScreenDetectionPublishInput,
-    AGENT_PENDING_IDLE_RECHECK, AGENT_STARTUP_GRACE_WINDOW,
+    observe_detection_content_change, should_skip_detection_update, DetectionPublishDecision,
+    DetectionScreenReadDecision, DetectionScreenReadInput, PendingIdleConfirmation,
+    ScreenDetectionPublishInput, AGENT_PENDING_IDLE_RECHECK, AGENT_STARTUP_GRACE_WINDOW,
 };
 #[cfg(any(unix, test))]
 pub use self::terminal::InputState;
@@ -988,7 +988,7 @@ fn spawn_basic_detection_task(
             last_screen_scan_detection_content_seq = current_detection_content_seq;
             let content_changed = content != last_detection_text;
             last_detection_text.clone_from(&content);
-            if !process_exited && crate::detect::should_skip_state_update(agent, &content) {
+            if should_skip_detection_update(agent, &content, process_exited) {
                 pending_idle.clear();
                 continue;
             }
@@ -2568,7 +2568,7 @@ impl PaneRuntime {
                     last_screen_scan_detection_content_seq = current_detection_content_seq;
                     let content_changed = content != last_detection_text;
                     last_detection_text.clone_from(&content);
-                    if detect::should_skip_state_update(agent, &content) {
+                    if should_skip_detection_update(agent, &content, process_exited) {
                         pending_idle.clear();
                         continue;
                     }
