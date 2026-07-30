@@ -364,6 +364,18 @@ mod tests {
         crate::layout::PaneId,
         tokio::sync::mpsc::Receiver<Bytes>,
     ) {
+        app_with_codex_screen(state, screen, true)
+    }
+
+    fn app_with_codex_screen(
+        state: AgentState,
+        screen: &[u8],
+        prime_without_action_evidence: bool,
+    ) -> (
+        App,
+        crate::layout::PaneId,
+        tokio::sync::mpsc::Receiver<Bytes>,
+    ) {
         let mut app = app_with_agent();
         let pane_id = app.state.workspaces[0].tabs[0].root_pane;
         let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
@@ -373,11 +385,29 @@ mod tests {
         terminal.set_agent_name("reviewer".into());
         terminal.set_detected_state(Some(Agent::Codex), state);
         terminal.last_agent_state_change_seq = Some(7);
+        let initial_screen = if prime_without_action_evidence {
+            &[][..]
+        } else {
+            screen
+        };
         let (runtime, rx) =
             crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
-                100, 24, 0, screen, 4,
+                100,
+                24,
+                0,
+                initial_screen,
+                4,
             );
         app.state.insert_test_runtime(pane_id, runtime);
+        if prime_without_action_evidence {
+            assert!(
+                app.agent_info(0, pane_id).unwrap().actions.is_empty(),
+                "a process must be observed without inherited action evidence before issuance"
+            );
+            app.lookup_runtime_sender(0, pane_id)
+                .unwrap()
+                .test_process_pty_bytes(screen);
+        }
         (app, pane_id, rx)
     }
 
@@ -487,6 +517,10 @@ No, and tell Codex what to do differently\n"
         app.lookup_runtime_sender(0, pane_id)
             .unwrap()
             .test_replace_agent_process_instance();
+        assert!(
+            app.agent_info(0, pane_id).unwrap().actions.is_empty(),
+            "replacement process must not inherit the previous process's screen evidence"
+        );
 
         let response = app.handle_agent_perform_action(
             "same-kind-replacement".into(),
@@ -496,6 +530,108 @@ No, and tell Codex what to do differently\n"
         );
         let error: ErrorResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(error.error.code, "agent_action_capability_stale");
+        assert!(rx.try_recv().is_err());
+
+        app.lookup_runtime_sender(0, pane_id)
+            .unwrap()
+            .test_advance_detection_content_seq();
+        assert!(
+            app.agent_info(0, pane_id).unwrap().actions.is_empty(),
+            "unrelated detection activity must not make inherited evidence fresh"
+        );
+        app.lookup_runtime_sender(0, pane_id)
+            .unwrap()
+            .test_process_pty_bytes(b"\x1b[2J\x1b[Hreplacement output\r\n");
+        assert!(
+            app.agent_info(0, pane_id).unwrap().actions.is_empty(),
+            "the replacement process must first clear inherited trusted evidence"
+        );
+        app.lookup_runtime_sender(0, pane_id)
+            .unwrap()
+            .test_process_pty_bytes(CODEX_INTERRUPT_SCREEN);
+        assert_eq!(
+            app.agent_info(0, pane_id).unwrap().actions.len(),
+            1,
+            "trusted evidence that reappears after the clear may issue a new capability"
+        );
+    }
+
+    #[tokio::test]
+    async fn cold_action_registry_does_not_trust_an_already_visible_footer() {
+        let (app, pane_id, _rx) =
+            app_with_codex_screen(AgentState::Working, CODEX_INTERRUPT_SCREEN, false);
+        assert!(
+            app.agent_info(0, pane_id).unwrap().actions.is_empty(),
+            "the first process observation cannot prove who produced an existing footer"
+        );
+
+        app.lookup_runtime_sender(0, pane_id)
+            .unwrap()
+            .test_advance_detection_content_seq();
+        assert!(
+            app.agent_info(0, pane_id).unwrap().actions.is_empty(),
+            "an unrelated sequence bump must not bless inherited footer evidence"
+        );
+        app.lookup_runtime_sender(0, pane_id)
+            .unwrap()
+            .test_process_pty_bytes(b"\x1b[2J\x1b[Hfresh process output\r\n");
+        assert!(app.agent_info(0, pane_id).unwrap().actions.is_empty());
+        app.lookup_runtime_sender(0, pane_id)
+            .unwrap()
+            .test_process_pty_bytes(CODEX_INTERRUPT_SCREEN);
+        assert_eq!(app.agent_info(0, pane_id).unwrap().actions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn replacement_boundary_does_not_trust_delayed_old_process_output() {
+        let (app, pane_id, _rx) = app_with_codex_action_screen(AgentState::Working, b"starting");
+        assert!(app.agent_info(0, pane_id).unwrap().actions.is_empty());
+        let runtime = app.lookup_runtime_sender(0, pane_id).unwrap();
+        runtime.test_replace_agent_process_instance();
+        runtime.test_emit_bytes_at_output_boundary(CODEX_INTERRUPT_SCREEN.to_vec());
+
+        assert!(
+            app.agent_info(0, pane_id).unwrap().actions.is_empty(),
+            "old-process bytes drained at the replacement boundary remain inherited evidence"
+        );
+        runtime.test_advance_detection_content_seq();
+        assert!(
+            app.agent_info(0, pane_id).unwrap().actions.is_empty(),
+            "unrelated activity cannot bless delayed old-process output"
+        );
+        runtime.test_process_pty_bytes(b"\x1b[2J\x1b[Hreplacement output\r\n");
+        assert!(app.agent_info(0, pane_id).unwrap().actions.is_empty());
+        runtime.test_process_pty_bytes(CODEX_INTERRUPT_SCREEN);
+        assert_eq!(app.agent_info(0, pane_id).unwrap().actions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn writer_boundary_process_replacement_rejects_and_consumes_interrupt() {
+        let (mut app, pane_id, mut rx) =
+            app_with_codex_action_screen(AgentState::Working, CODEX_INTERRUPT_SCREEN);
+        let capability = only_action(&app, pane_id, AgentActionKind::Interrupt);
+        app.lookup_runtime_sender(0, pane_id)
+            .unwrap()
+            .test_replace_agent_at_guarded_write_boundary();
+
+        let response = app.handle_agent_perform_action(
+            "writer-boundary-replacement".into(),
+            AgentPerformActionParams {
+                capability_id: capability.capability_id.clone(),
+            },
+        );
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "agent_action_capability_stale");
+        assert!(rx.try_recv().is_err());
+
+        let replay = app.handle_agent_perform_action(
+            "writer-boundary-replay".into(),
+            AgentPerformActionParams {
+                capability_id: capability.capability_id,
+            },
+        );
+        let error: ErrorResponse = serde_json::from_str(&replay).unwrap();
+        assert_eq!(error.error.code, "agent_action_capability_not_found");
         assert!(rx.try_recv().is_err());
     }
 
@@ -670,12 +806,20 @@ No, and tell Codex what to do differently\n"
         ));
         assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"\x1b"));
         assert_eq!(app.agent_action_registry.entry_counts_for_test(), (0, 1));
+        assert_eq!(
+            app.agent_action_registry.process_evidence_count_for_test(),
+            1
+        );
 
         app.state.terminals.remove(&terminal_id);
         app.state.terminal_runtime_shutdowns.push(terminal_id);
         app.shutdown_detached_terminal_runtimes();
 
         assert_eq!(app.agent_action_registry.entry_counts_for_test(), (0, 0));
+        assert_eq!(
+            app.agent_action_registry.process_evidence_count_for_test(),
+            0
+        );
     }
 
     #[tokio::test]

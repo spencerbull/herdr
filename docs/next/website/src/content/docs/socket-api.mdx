@@ -798,7 +798,18 @@ semantic status, state-change sequence, revision, trusted bundled-manifest
 evidence, detection-content sequence, and a fingerprint of the screen plus OSC
 evidence. It then sends exactly one server-selected key: Enter for `approve` or
 Escape for `interrupt`. The request cannot choose a target, action, or raw key
-payload.
+payload. Guarded actions use one canonical byte (`CR` or `ESC`) independent of
+terminal keyboard protocol.
+
+The guarded write does not use the ordinary asynchronous input queue. Herdr
+accepts it only when no earlier user input remains queued, blocks later user
+input from interposing, consumes already-readable PTY output before and after
+validation, revalidates the exact process and a coherent screen/OSC snapshot in
+the PTY writer, and reports success only after the one-byte write succeeds. A
+backpressured write is cancelled after a short deadline and cannot be written
+later after an error response. Guarded capabilities are currently withheld on
+Windows because the synchronous ConPTY writer cannot be cancelled safely; Herdr
+does not fall back to the ordinary queue.
 
 `approve` is reserved in the typed action enum, but Herdr intentionally does not
 issue approval capabilities yet. Current prompt families do not provide a
@@ -810,10 +821,21 @@ footer; local overrides, downloaded manifests, a spinner, or lifecycle status
 alone do not qualify.
 
 Revalidation is intentionally conservative and can reject an action after any
-redraw or state change. It closes the client/API time-of-check gap, but PTY
-output can still race the final queue write; clients should describe the action
-as perform-time revalidated, not transactionally atomic. Refresh agent state and
-wait for a newly issued capability instead of retrying a rejected or failed ID.
+redraw, state change, process replacement, queued input, or writer
+backpressure. A same-kind replacement process cannot inherit the previous
+process's screen: on the first process observation and every replacement, Herdr
+drains buffered PTY output, rechecks the exact process, and only then records the
+detection baseline. Trusted evidence already visible at that boundary must
+disappear and later reappear before a capability can be issued. Evidence first
+painted after an evidence-free boundary can qualify normally. Environment hints
+can identify an agent for presentation, but cannot establish the exact
+executable identity required by a guarded action.
+
+The remaining race is the final writer-boundary validation return to the
+one-byte PTY write syscall; the external process can still change in that
+interval, so clients should describe the action as writer-boundary revalidated,
+not transactionally atomic. Refresh agent state and wait for a newly issued
+capability instead of retrying a rejected or failed ID.
 
 Use `pane.report_metadata` when a user hook wants to customize presentation without taking over lifecycle state from a Herdr integration.
 

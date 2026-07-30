@@ -373,6 +373,23 @@ impl TerminalRuntime {
         self.0.detection_content_seq()
     }
 
+    pub(crate) fn guarded_detection_validator(
+        &self,
+        expected_agent: crate::detect::Agent,
+        expected_content_seq: u64,
+        expected_screen: String,
+        expected_osc_title: String,
+        expected_osc_progress: String,
+    ) -> crate::pty::actor::GuardedWriteValidator {
+        self.0.guarded_detection_validator(
+            expected_agent,
+            expected_content_seq,
+            expected_screen,
+            expected_osc_title,
+            expected_osc_progress,
+        )
+    }
+
     pub fn terminal_title(&self) -> Option<String> {
         self.0.terminal_title()
     }
@@ -464,6 +481,22 @@ impl TerminalRuntime {
 
     pub fn send_bytes_after(&self, bytes: Bytes, delay: std::time::Duration) {
         self.0.send_bytes_after(bytes, delay);
+    }
+
+    pub(crate) fn write_guarded(
+        &self,
+        bytes: Bytes,
+        validate: crate::pty::actor::GuardedWriteValidator,
+    ) -> Result<(), crate::pty::actor::GuardedWriteError> {
+        self.0.write_guarded(bytes, validate)
+    }
+
+    pub(crate) fn guarded_writes_supported(&self) -> bool {
+        self.0.guarded_writes_supported()
+    }
+
+    pub(crate) fn drain_output_boundary(&self) -> Result<(), crate::pty::actor::GuardedWriteError> {
+        self.0.drain_output_boundary()
     }
 
     pub async fn send_paste(&self, text: String) -> Result<(), mpsc::error::SendError<Bytes>> {
@@ -567,14 +600,40 @@ impl TerminalRuntime {
         self.0.child_pid()
     }
 
+    pub(crate) fn child_pid_handle(&self) -> Arc<std::sync::atomic::AtomicU32> {
+        self.0.child_pid_handle()
+    }
+
     #[cfg(test)]
     pub(crate) fn test_agent_process_start_identity(&self) -> u64 {
         self.0.test_agent_process_start_identity()
     }
 
     #[cfg(test)]
+    pub(crate) fn test_agent_process_start_identity_handle(
+        &self,
+    ) -> Arc<std::sync::atomic::AtomicU64> {
+        self.0.test_agent_process_start_identity_handle()
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_replace_agent_process_instance(&self) {
         self.0.test_replace_agent_process_instance();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_replace_agent_at_guarded_write_boundary(&self) {
+        self.0.test_replace_agent_at_guarded_write_boundary();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_advance_detection_content_seq(&self) {
+        self.0.test_advance_detection_content_seq();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_emit_bytes_at_output_boundary(&self, bytes: Vec<u8>) {
+        self.0.test_emit_bytes_at_output_boundary(bytes);
     }
 
     pub(crate) fn current_size(&self) -> (u16, u16) {

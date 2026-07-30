@@ -2,7 +2,10 @@ use std::{
     collections::VecDeque,
     io::{Read, Write},
     os::fd::{AsRawFd, OwnedFd, RawFd},
-    sync::{mpsc as std_mpsc, Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc as std_mpsc, Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 
@@ -12,12 +15,15 @@ use tracing::{debug, warn};
 
 use crate::pty::fd;
 
+use super::{GuardedWriteError, GuardedWriteValidator};
+
 // Actor handle methods must call wake_actor() after queuing work. The idle
 // timeout is only a fallback for missed wakes; PTY and wake readiness drive
 // normal responsiveness.
 const ACTOR_IDLE_POLL_MS: i32 = 1000;
 const ACTOR_COMMAND_BUFFER: usize = 1024;
 const HANDOFF_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+const GUARDED_WRITE_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActorState {
@@ -73,10 +79,21 @@ pub(crate) struct PtyIoActorConfig {
 
 enum PtyIoDataCommand {
     WriteUserInput(Bytes),
+    GuardedWrite {
+        bytes: Bytes,
+        validate: GuardedWriteValidator,
+        deadline: Instant,
+        cancelled: Arc<AtomicBool>,
+        reply: std_mpsc::Sender<Result<(), GuardedWriteError>>,
+    },
 }
 
 enum PtyIoControlCommand {
     BeginHandoff(std_mpsc::Sender<std::io::Result<()>>),
+    DrainOutputBoundary {
+        deadline: Instant,
+        reply: std_mpsc::Sender<Result<(), GuardedWriteError>>,
+    },
     DuplicateForHandoff(std_mpsc::Sender<std::io::Result<RawFd>>),
     ForegroundProcessGroup(std_mpsc::Sender<Option<u32>>),
     RollbackHandoff(std_mpsc::Sender<std::io::Result<()>>),
@@ -97,6 +114,8 @@ pub(crate) struct PtyIoActorHandle {
 #[derive(Debug)]
 struct UserWriteGate {
     accepting: bool,
+    queued_user_writes: usize,
+    guarded_write_pending: bool,
 }
 
 impl PtyIoActorHandle {
@@ -109,7 +128,7 @@ impl PtyIoActorHandle {
                 .user_writes
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if !user_writes.accepting {
+            if !user_writes.accepting || user_writes.guarded_write_pending {
                 return Err(mpsc::error::SendError(bytes));
             }
         }
@@ -119,13 +138,14 @@ impl PtyIoActorHandle {
             Err(_) => return Err(mpsc::error::SendError(bytes)),
         };
 
-        let user_writes = self
+        let mut user_writes = self
             .user_writes
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !user_writes.accepting {
+        if !user_writes.accepting || user_writes.guarded_write_pending {
             return Err(mpsc::error::SendError(bytes));
         }
+        user_writes.queued_user_writes = user_writes.queued_user_writes.saturating_add(1);
         permit.send(PtyIoDataCommand::WriteUserInput(bytes));
         self.wake_actor();
         Ok(())
@@ -135,13 +155,14 @@ impl PtyIoActorHandle {
         &self,
         bytes: Bytes,
     ) -> Result<(), mpsc::error::TrySendError<Bytes>> {
-        let user_writes = self
+        let mut user_writes = self
             .user_writes
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !user_writes.accepting {
+        if !user_writes.accepting || user_writes.guarded_write_pending {
             return Err(mpsc::error::TrySendError::Closed(bytes));
         }
+        user_writes.queued_user_writes = user_writes.queued_user_writes.saturating_add(1);
         match self
             .data_tx
             .try_send(PtyIoDataCommand::WriteUserInput(bytes))
@@ -151,11 +172,88 @@ impl PtyIoActorHandle {
                 Ok(())
             }
             Err(mpsc::error::TrySendError::Full(PtyIoDataCommand::WriteUserInput(bytes))) => {
+                user_writes.queued_user_writes = user_writes.queued_user_writes.saturating_sub(1);
                 Err(mpsc::error::TrySendError::Full(bytes))
             }
             Err(mpsc::error::TrySendError::Closed(PtyIoDataCommand::WriteUserInput(bytes))) => {
+                user_writes.queued_user_writes = user_writes.queued_user_writes.saturating_sub(1);
                 Err(mpsc::error::TrySendError::Closed(bytes))
             }
+            Err(_) => unreachable!("try_write_user_input only queues ordinary input"),
+        }
+    }
+
+    pub(crate) fn write_guarded(
+        &self,
+        bytes: Bytes,
+        validate: GuardedWriteValidator,
+    ) -> Result<(), GuardedWriteError> {
+        if bytes.len() != 1 {
+            return Err(GuardedWriteError::Io(
+                "guarded writes must contain exactly one byte".to_string(),
+            ));
+        }
+        let (reply_tx, reply_rx) = std_mpsc::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        {
+            let mut user_writes = self
+                .user_writes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !user_writes.accepting {
+                return Err(GuardedWriteError::Closed);
+            }
+            if user_writes.queued_user_writes != 0 || user_writes.guarded_write_pending {
+                return Err(GuardedWriteError::Busy);
+            }
+            user_writes.guarded_write_pending = true;
+            match self.data_tx.try_send(PtyIoDataCommand::GuardedWrite {
+                bytes,
+                validate,
+                deadline: Instant::now() + GUARDED_WRITE_TIMEOUT,
+                cancelled: Arc::clone(&cancelled),
+                reply: reply_tx,
+            }) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    user_writes.guarded_write_pending = false;
+                    return Err(GuardedWriteError::Busy);
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    user_writes.guarded_write_pending = false;
+                    return Err(GuardedWriteError::Closed);
+                }
+            }
+            self.wake_actor();
+        }
+        match reply_rx.recv_timeout(GUARDED_WRITE_TIMEOUT) {
+            Ok(result) => result,
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => Err(GuardedWriteError::Closed),
+            Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                cancelled.store(true, Ordering::Release);
+                self.wake_actor();
+                reply_rx.recv().unwrap_or(Err(GuardedWriteError::Closed))
+            }
+        }
+    }
+
+    pub(crate) const fn guarded_writes_supported(&self) -> bool {
+        true
+    }
+
+    pub(crate) fn drain_output_boundary(&self) -> Result<(), GuardedWriteError> {
+        let (reply_tx, reply_rx) = std_mpsc::channel();
+        self.control_tx
+            .send(PtyIoControlCommand::DrainOutputBoundary {
+                deadline: Instant::now() + GUARDED_WRITE_TIMEOUT,
+                reply: reply_tx,
+            })
+            .map_err(|_| GuardedWriteError::Closed)?;
+        self.wake_actor();
+        match reply_rx.recv_timeout(GUARDED_WRITE_TIMEOUT) {
+            Ok(result) => result,
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => Err(GuardedWriteError::Closed),
+            Err(std_mpsc::RecvTimeoutError::Timeout) => Err(GuardedWriteError::TimedOut),
         }
     }
 
@@ -367,6 +465,8 @@ impl PtyIoActor {
         let wake_pipe = fd::create_wake_pipe()?;
         let user_writes = Arc::new(Mutex::new(UserWriteGate {
             accepting: !config.initially_quiesced,
+            queued_user_writes: 0,
+            guarded_write_pending: false,
         }));
         let controls = Arc::new(Mutex::new(SharedPtyControls::default()));
         let response_order = Arc::new(Mutex::new(()));
@@ -374,7 +474,7 @@ impl PtyIoActor {
             data_tx,
             control_tx,
             wake: wake_pipe.writer,
-            user_writes,
+            user_writes: Arc::clone(&user_writes),
             controls: Arc::clone(&controls),
             response_order: Arc::clone(&response_order),
         };
@@ -394,6 +494,7 @@ impl PtyIoActor {
             wake_read_fd: wake_pipe.read_fd,
             controls,
             response_order,
+            user_writes,
             on_read: config.on_read,
             on_reader_exit: config.on_reader_exit,
             poll_observer,
@@ -415,26 +516,57 @@ impl PtyIoActor {
     }
 }
 
+enum PendingWrite {
+    UserInput(Bytes),
+    TerminalResponse(Bytes),
+    Guarded {
+        bytes: Bytes,
+        validate: GuardedWriteValidator,
+        deadline: Instant,
+        cancelled: Arc<AtomicBool>,
+        reply: std_mpsc::Sender<Result<(), GuardedWriteError>>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuardedReadResult {
+    NoData,
+    DataRead,
+    Closed,
+}
+
+impl PendingWrite {
+    fn bytes(&self) -> &Bytes {
+        match self {
+            Self::UserInput(bytes)
+            | Self::TerminalResponse(bytes)
+            | Self::Guarded { bytes, .. } => bytes,
+        }
+    }
+}
+
 struct PtyIoActorRunner {
     pane_id: u32,
     file: std::fs::File,
     data_rx: mpsc::Receiver<PtyIoDataCommand>,
     control_rx: std_mpsc::Receiver<PtyIoControlCommand>,
     state: ActorState,
-    pending_writes: VecDeque<Bytes>,
+    pending_writes: VecDeque<PendingWrite>,
     current_write_offset: usize,
     wake_read_fd: OwnedFd,
     controls: Arc<Mutex<SharedPtyControls>>,
     response_order: Arc<Mutex<()>>,
+    user_writes: Arc<Mutex<UserWriteGate>>,
     on_read: ReadCallback,
     on_reader_exit: Option<ReaderExitCallback>,
     poll_observer: Option<std_mpsc::Sender<()>>,
 }
 
 impl PtyIoActorRunner {
-    fn enqueue_write(&mut self, bytes: Bytes) {
+    fn enqueue_terminal_response(&mut self, bytes: Bytes) {
         if !bytes.is_empty() {
-            self.pending_writes.push_back(bytes);
+            self.pending_writes
+                .push_back(PendingWrite::TerminalResponse(bytes));
         }
     }
 
@@ -488,6 +620,8 @@ impl PtyIoActorRunner {
             }
         }
 
+        self.fail_pending_writes(GuardedWriteError::Closed);
+        self.close_user_write_gate();
         if let Some(on_reader_exit) = self.on_reader_exit.take() {
             on_reader_exit();
         }
@@ -545,7 +679,37 @@ impl PtyIoActorRunner {
         match command {
             PtyIoDataCommand::WriteUserInput(bytes) => {
                 if self.state == ActorState::Running {
-                    self.enqueue_write(bytes);
+                    if bytes.is_empty() {
+                        self.finish_user_write();
+                    } else {
+                        self.pending_writes
+                            .push_back(PendingWrite::UserInput(bytes));
+                    }
+                } else {
+                    self.finish_user_write();
+                }
+            }
+            PtyIoDataCommand::GuardedWrite {
+                bytes,
+                validate,
+                deadline,
+                cancelled,
+                reply,
+            } => {
+                if self.state != ActorState::Running {
+                    self.finish_guarded_write();
+                    let _ = reply.send(Err(GuardedWriteError::Closed));
+                } else if !self.pending_writes.is_empty() {
+                    self.finish_guarded_write();
+                    let _ = reply.send(Err(GuardedWriteError::Busy));
+                } else {
+                    self.pending_writes.push_back(PendingWrite::Guarded {
+                        bytes,
+                        validate,
+                        deadline,
+                        cancelled,
+                        reply,
+                    });
                 }
             }
         }
@@ -557,6 +721,18 @@ impl PtyIoActorRunner {
             PtyIoControlCommand::BeginHandoff(reply) => {
                 let result = self.begin_handoff();
                 let _ = reply.send(result);
+            }
+            PtyIoControlCommand::DrainOutputBoundary { deadline, reply } => {
+                let result = if self.state == ActorState::Running {
+                    self.drain_output_boundary(deadline)
+                } else {
+                    Err(GuardedWriteError::Busy)
+                };
+                let closed = result == Err(GuardedWriteError::Closed);
+                let _ = reply.send(result);
+                if closed {
+                    return true;
+                }
             }
             PtyIoControlCommand::DuplicateForHandoff(reply) => {
                 let result = if self.state == ActorState::Quiesced {
@@ -587,7 +763,7 @@ impl PtyIoActorRunner {
             }
             PtyIoControlCommand::ReleaseAfterCommit(reply) => {
                 self.state = ActorState::Released;
-                self.pending_writes.clear();
+                self.fail_pending_writes(GuardedWriteError::Closed);
                 let _ = reply.send(Ok(()));
                 return true;
             }
@@ -641,10 +817,8 @@ impl PtyIoActorRunner {
     }
 
     fn drain_pre_quiesce_commands(&mut self) {
-        while let Ok(PtyIoDataCommand::WriteUserInput(bytes)) = self.data_rx.try_recv() {
-            if self.state != ActorState::Released {
-                self.enqueue_write(bytes);
-            }
+        while let Ok(command) = self.data_rx.try_recv() {
+            self.handle_data_command(command);
         }
     }
 
@@ -684,28 +858,73 @@ impl PtyIoActorRunner {
                 false
             }
             Ok(n) => {
-                let response_order = Arc::clone(&self.response_order);
-                let _order = response_order
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let result = (self.on_read)(&buf[..n]);
-                self.controls
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .terminal_responses
-                    .extend(result.terminal_responses);
-                drop(_order);
-                let terminal_responses = std::mem::take(
-                    &mut self
-                        .controls
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .terminal_responses,
-                );
-                self.enqueue_terminal_responses(terminal_responses);
+                self.process_read_bytes(&buf[..n]);
                 true
             }
         }
+    }
+
+    fn read_pending_output_before_guarded_write(&mut self) -> GuardedReadResult {
+        let mut buf = [0u8; 8192];
+        loop {
+            match self.file.read(&mut buf) {
+                Ok(0) => return GuardedReadResult::Closed,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    return GuardedReadResult::NoData;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(err) => {
+                    debug!(
+                        pane = self.pane_id,
+                        err = %err,
+                        "PTY actor pre-guard read failed"
+                    );
+                    return GuardedReadResult::Closed;
+                }
+                Ok(n) => {
+                    self.process_read_bytes(&buf[..n]);
+                    return GuardedReadResult::DataRead;
+                }
+            }
+        }
+    }
+
+    fn drain_output_boundary(&mut self, deadline: Instant) -> Result<(), GuardedWriteError> {
+        let mut buf = [0u8; 8192];
+        loop {
+            if Instant::now() >= deadline {
+                return Err(GuardedWriteError::TimedOut);
+            }
+            match self.file.read(&mut buf) {
+                Ok(0) => return Err(GuardedWriteError::Closed),
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(err) => return Err(GuardedWriteError::Io(err.to_string())),
+                Ok(n) => self.process_read_bytes(&buf[..n]),
+            }
+        }
+    }
+
+    fn process_read_bytes(&mut self, bytes: &[u8]) {
+        let response_order = Arc::clone(&self.response_order);
+        let _order = response_order
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let result = (self.on_read)(bytes);
+        self.controls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .terminal_responses
+            .extend(result.terminal_responses);
+        drop(_order);
+        let terminal_responses = std::mem::take(
+            &mut self
+                .controls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .terminal_responses,
+        );
+        self.enqueue_terminal_responses(terminal_responses);
     }
 
     fn enqueue_terminal_responses(&mut self, terminal_responses: Vec<Bytes>) {
@@ -713,36 +932,203 @@ impl PtyIoActorRunner {
             return;
         }
         for bytes in terminal_responses {
-            self.enqueue_write(bytes);
+            self.enqueue_terminal_response(bytes);
         }
     }
 
     fn flush_pending_writes_once(&mut self) {
-        while let Some(bytes) = self.pending_writes.front() {
-            let chunk = &bytes[self.current_write_offset..];
+        while !self.pending_writes.is_empty() {
+            if self.current_write_offset == 0
+                && matches!(
+                    self.pending_writes.front(),
+                    Some(PendingWrite::Guarded { .. })
+                )
+            {
+                match self.read_pending_output_before_guarded_write() {
+                    GuardedReadResult::NoData => {}
+                    GuardedReadResult::DataRead => {
+                        let pending = self
+                            .pending_writes
+                            .pop_front()
+                            .expect("guarded write remains queued");
+                        self.complete_pending_write(
+                            pending,
+                            Err(GuardedWriteError::ValidationFailed),
+                        );
+                        continue;
+                    }
+                    GuardedReadResult::Closed => {
+                        self.fail_pending_writes(GuardedWriteError::Closed);
+                        return;
+                    }
+                }
+            }
+
+            if self.current_write_offset == 0 {
+                let guarded_failure = {
+                    let pending = self
+                        .pending_writes
+                        .front()
+                        .expect("pending write remains queued");
+                    match pending {
+                        PendingWrite::Guarded {
+                            deadline,
+                            cancelled,
+                            ..
+                        } if cancelled.load(Ordering::Acquire) || Instant::now() >= *deadline => {
+                            Some(GuardedWriteError::TimedOut)
+                        }
+                        PendingWrite::Guarded {
+                            validate,
+                            deadline,
+                            cancelled,
+                            ..
+                        } => {
+                            let valid =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    validate()
+                                }))
+                                .unwrap_or(false);
+                            if !valid {
+                                Some(GuardedWriteError::ValidationFailed)
+                            } else if cancelled.load(Ordering::Acquire)
+                                || Instant::now() >= *deadline
+                            {
+                                Some(GuardedWriteError::TimedOut)
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    }
+                };
+                if let Some(error) = guarded_failure {
+                    let pending = self
+                        .pending_writes
+                        .pop_front()
+                        .expect("guarded write remains queued");
+                    self.complete_pending_write(pending, Err(error));
+                    continue;
+                }
+
+                if matches!(
+                    self.pending_writes.front(),
+                    Some(PendingWrite::Guarded { .. })
+                ) {
+                    match self.read_pending_output_before_guarded_write() {
+                        GuardedReadResult::NoData => {}
+                        GuardedReadResult::DataRead => {
+                            let pending = self
+                                .pending_writes
+                                .pop_front()
+                                .expect("guarded write remains queued");
+                            self.complete_pending_write(
+                                pending,
+                                Err(GuardedWriteError::ValidationFailed),
+                            );
+                            continue;
+                        }
+                        GuardedReadResult::Closed => {
+                            self.fail_pending_writes(GuardedWriteError::Closed);
+                            return;
+                        }
+                    }
+                }
+            }
+
+            let pending = self
+                .pending_writes
+                .front()
+                .expect("pending write remains queued");
+            let chunk = &pending.bytes()[self.current_write_offset..];
             match self.file.write(chunk) {
                 Ok(0) => {
                     warn!(pane = self.pane_id, "PTY actor write returned zero bytes");
+                    if matches!(pending, PendingWrite::Guarded { .. }) {
+                        let pending = self
+                            .pending_writes
+                            .pop_front()
+                            .expect("guarded write remains queued");
+                        self.current_write_offset = 0;
+                        self.complete_pending_write(
+                            pending,
+                            Err(GuardedWriteError::Io(
+                                std::io::ErrorKind::WriteZero.to_string(),
+                            )),
+                        );
+                    }
                     return;
                 }
                 Ok(written) => {
                     self.current_write_offset += written;
-                    if self.current_write_offset >= bytes.len() {
-                        self.pending_writes.pop_front();
+                    if self.current_write_offset >= pending.bytes().len() {
+                        let pending = self
+                            .pending_writes
+                            .pop_front()
+                            .expect("completed write remains queued");
                         self.current_write_offset = 0;
+                        self.complete_pending_write(pending, Ok(()));
                     }
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return,
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => return,
                 Err(err) => {
                     warn!(pane = self.pane_id, err = %err, "PTY actor write failed");
-                    self.pending_writes.clear();
+                    self.fail_pending_writes(GuardedWriteError::Io(err.to_string()));
                     self.current_write_offset = 0;
                     return;
                 }
             }
         }
         let _ = self.file.flush();
+    }
+
+    fn complete_pending_write(
+        &mut self,
+        pending: PendingWrite,
+        result: Result<(), GuardedWriteError>,
+    ) {
+        match pending {
+            PendingWrite::UserInput(_) => self.finish_user_write(),
+            PendingWrite::TerminalResponse(_) => {}
+            PendingWrite::Guarded { reply, .. } => {
+                self.finish_guarded_write();
+                let _ = reply.send(result);
+            }
+        }
+    }
+
+    fn fail_pending_writes(&mut self, error: GuardedWriteError) {
+        while let Some(pending) = self.pending_writes.pop_front() {
+            self.complete_pending_write(pending, Err(error.clone()));
+        }
+        self.current_write_offset = 0;
+    }
+
+    fn finish_user_write(&self) {
+        let mut gate = self
+            .user_writes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        gate.queued_user_writes = gate.queued_user_writes.saturating_sub(1);
+    }
+
+    fn finish_guarded_write(&self) {
+        let mut gate = self
+            .user_writes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        gate.guarded_write_pending = false;
+    }
+
+    fn close_user_write_gate(&self) {
+        let mut gate = self
+            .user_writes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        gate.accepting = false;
+        gate.queued_user_writes = 0;
+        gate.guarded_write_pending = false;
     }
 
     fn resize(&self, resize: PtyResize) {
@@ -823,6 +1209,14 @@ mod tests {
         (pipe.writer, pipe.read_fd)
     }
 
+    fn test_user_write_gate() -> Arc<Mutex<UserWriteGate>> {
+        Arc::new(Mutex::new(UserWriteGate {
+            accepting: true,
+            queued_user_writes: 0,
+            guarded_write_pending: false,
+        }))
+    }
+
     fn actor_with_socket_pair(
         initially_quiesced: bool,
     ) -> (PtyIoActorHandle, UnixStream, std_mpsc::Receiver<Bytes>) {
@@ -882,11 +1276,41 @@ mod tests {
             wake_read_fd: wake_pipe.read_fd,
             controls: Arc::new(Mutex::new(SharedPtyControls::default())),
             response_order: Arc::new(Mutex::new(())),
+            user_writes: test_user_write_gate(),
             on_read: Box::new(|_| PtyReadResult::empty()),
             on_reader_exit: None,
             poll_observer: None,
         };
         (runner, peer)
+    }
+
+    fn backpressured_actor() -> (PtyIoActorHandle, UnixStream, usize) {
+        let (mut actor_socket, peer) = UnixStream::pair().expect("socket pair");
+        actor_socket
+            .set_nonblocking(true)
+            .expect("actor socket nonblocking");
+        peer.set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("peer timeout");
+        let fill = [0xAA; 8192];
+        let mut prefilled = 0;
+        loop {
+            match actor_socket.write(&fill) {
+                Ok(written) => prefilled += written,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(err) => panic!("failed to fill actor write buffer: {err}"),
+            }
+        }
+        assert!(prefilled > 0);
+        let owned = unsafe { OwnedFd::from_raw_fd(actor_socket.into_raw_fd()) };
+        let handle = PtyIoActor::spawn(PtyIoActorConfig {
+            pane_id: 1,
+            master_fd: owned,
+            initially_quiesced: false,
+            on_read: Box::new(|_| PtyReadResult::empty()),
+            on_reader_exit: None,
+        })
+        .expect("actor spawn");
+        (handle, peer, prefilled)
     }
 
     #[test]
@@ -909,6 +1333,237 @@ mod tests {
         let mut buf = [0u8; 5];
         peer.read_exact(&mut buf).expect("peer receives write");
         assert_eq!(&buf, b"hello");
+        handle.shutdown();
+    }
+
+    #[test]
+    fn output_boundary_drains_pending_pty_output_before_acknowledging() {
+        let (handle, mut peer, read_rx) = actor_with_socket_pair(false);
+        peer.write_all(b"old process footer")
+            .expect("old process output reaches actor fd");
+
+        handle
+            .drain_output_boundary()
+            .expect("output boundary succeeds");
+
+        assert_eq!(
+            read_rx.try_recv().expect("output callback completed"),
+            Bytes::from_static(b"old process footer")
+        );
+        handle.shutdown();
+    }
+
+    #[test]
+    fn guarded_write_rejects_an_earlier_queued_user_write_without_validating() {
+        let (data_tx, mut data_rx) = mpsc::channel(2);
+        let (control_tx, _control_rx) = std_mpsc::channel();
+        let (wake, _wake_read_fd) = test_wake_pair();
+        let handle = PtyIoActorHandle {
+            data_tx,
+            control_tx,
+            wake,
+            user_writes: test_user_write_gate(),
+            controls: Arc::new(Mutex::new(SharedPtyControls::default())),
+            response_order: Arc::new(Mutex::new(())),
+        };
+        handle
+            .try_write_user_input(Bytes::from_static(b"earlier"))
+            .expect("ordinary input queued");
+        let validations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let validation_count = Arc::clone(&validations);
+
+        let result = handle.write_guarded(
+            Bytes::from_static(b"\x1b"),
+            Arc::new(move || {
+                validation_count.fetch_add(1, Ordering::AcqRel);
+                true
+            }),
+        );
+
+        assert_eq!(result, Err(GuardedWriteError::Busy));
+        assert_eq!(validations.load(Ordering::Acquire), 0);
+        assert!(matches!(
+            data_rx.try_recv(),
+            Ok(PtyIoDataCommand::WriteUserInput(bytes))
+                if bytes == Bytes::from_static(b"earlier")
+        ));
+        assert!(matches!(data_rx.try_recv(), Err(DataTryRecvError::Empty)));
+    }
+
+    #[test]
+    fn guarded_write_observes_pending_pty_output_before_validating() {
+        let (mut runner, mut peer) = actor_runner_for_unit_test();
+        let output_observed = Arc::new(AtomicBool::new(false));
+        let observed_by_callback = Arc::clone(&output_observed);
+        runner.on_read = Box::new(move |_| {
+            observed_by_callback.store(true, Ordering::Release);
+            PtyReadResult::empty()
+        });
+        peer.write_all(b"pending redraw")
+            .expect("pending PTY output reaches actor fd");
+
+        let validations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let validation_count = Arc::clone(&validations);
+        let (reply_tx, reply_rx) = std_mpsc::channel();
+        runner.handle_data_command(PtyIoDataCommand::GuardedWrite {
+            bytes: Bytes::from_static(b"\x1b"),
+            validate: Arc::new(move || {
+                validation_count.fetch_add(1, Ordering::AcqRel);
+                true
+            }),
+            deadline: Instant::now() + GUARDED_WRITE_TIMEOUT,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            reply: reply_tx,
+        });
+
+        runner.flush_pending_writes_once();
+
+        assert!(output_observed.load(Ordering::Acquire));
+        assert_eq!(validations.load(Ordering::Acquire), 0);
+        assert_eq!(
+            reply_rx.recv().expect("guarded result"),
+            Err(GuardedWriteError::ValidationFailed)
+        );
+        peer.set_nonblocking(true).expect("peer nonblocking");
+        let mut action = [0; 1];
+        let err = peer
+            .read(&mut action)
+            .expect_err("stale guarded byte must not be written");
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn guarded_write_rechecks_for_pty_output_after_validating() {
+        let (mut runner, mut peer) = actor_runner_for_unit_test();
+        let output_observed = Arc::new(AtomicBool::new(false));
+        let observed_by_callback = Arc::clone(&output_observed);
+        runner.on_read = Box::new(move |_| {
+            observed_by_callback.store(true, Ordering::Release);
+            PtyReadResult::empty()
+        });
+        let output_peer = Arc::new(Mutex::new(peer.try_clone().expect("clone output peer")));
+        let (reply_tx, reply_rx) = std_mpsc::channel();
+        runner.handle_data_command(PtyIoDataCommand::GuardedWrite {
+            bytes: Bytes::from_static(b"\x1b"),
+            validate: Arc::new(move || {
+                output_peer
+                    .lock()
+                    .expect("output peer lock")
+                    .write_all(b"redraw during validation")
+                    .expect("redraw reaches actor fd");
+                true
+            }),
+            deadline: Instant::now() + GUARDED_WRITE_TIMEOUT,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            reply: reply_tx,
+        });
+
+        runner.flush_pending_writes_once();
+
+        assert!(output_observed.load(Ordering::Acquire));
+        assert_eq!(
+            reply_rx.recv().expect("guarded result"),
+            Err(GuardedWriteError::ValidationFailed)
+        );
+        peer.set_nonblocking(true).expect("peer nonblocking");
+        let mut action = [0; 1];
+        let err = peer
+            .read(&mut action)
+            .expect_err("guarded byte must not follow a validation-time redraw");
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn guarded_write_validates_at_writable_boundary_and_acks_after_write() {
+        let (handle, mut peer, prefilled) = backpressured_actor();
+        let validations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let validation_count = Arc::clone(&validations);
+        let guarded_handle = handle.clone();
+        let guarded = std::thread::spawn(move || {
+            guarded_handle.write_guarded(
+                Bytes::from_static(b"\x1b"),
+                Arc::new(move || {
+                    validation_count.fetch_add(1, Ordering::AcqRel);
+                    true
+                }),
+            )
+        });
+
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !guarded.is_finished(),
+            "guarded action must not acknowledge a backpressured write"
+        );
+        assert!(
+            handle
+                .try_write_user_input(Bytes::from_static(b"later"))
+                .is_err(),
+            "ordinary input cannot interpose while a guarded write is pending"
+        );
+
+        let mut prefill = vec![0; prefilled];
+        peer.read_exact(&mut prefill)
+            .expect("peer drains prefilled actor buffer");
+        assert!(prefill.iter().all(|byte| *byte == 0xAA));
+        guarded
+            .join()
+            .expect("guarded writer joins")
+            .expect("guarded write succeeds after PTY becomes writable");
+        let mut action = [0; 1];
+        peer.read_exact(&mut action)
+            .expect("peer receives guarded byte before success acknowledgment");
+        assert_eq!(action, [0x1b]);
+        assert!(validations.load(Ordering::Acquire) >= 2);
+        handle.shutdown();
+    }
+
+    #[test]
+    fn guarded_write_timeout_cancels_before_later_writability() {
+        let (handle, mut peer, prefilled) = backpressured_actor();
+        let guarded_handle = handle.clone();
+        let guarded = std::thread::spawn(move || {
+            guarded_handle.write_guarded(Bytes::from_static(b"\x1b"), Arc::new(|| true))
+        });
+
+        assert_eq!(
+            guarded.join().expect("guarded writer joins"),
+            Err(GuardedWriteError::TimedOut)
+        );
+
+        let mut prefill = vec![0; prefilled];
+        peer.read_exact(&mut prefill)
+            .expect("peer drains prefilled actor buffer");
+        peer.set_read_timeout(Some(Duration::from_millis(100)))
+            .expect("short peer timeout");
+        let mut action = [0; 1];
+        let err = peer
+            .read_exact(&mut action)
+            .expect_err("cancelled guarded byte must never be written later");
+        assert!(matches!(
+            err.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ));
+        handle.shutdown();
+    }
+
+    #[test]
+    fn guarded_write_contains_validator_panics_and_keeps_actor_usable() {
+        let (handle, mut peer, _read_rx) = actor_with_socket_pair(false);
+
+        assert_eq!(
+            handle.write_guarded(
+                Bytes::from_static(b"\x1b"),
+                Arc::new(|| panic!("validator panic"))
+            ),
+            Err(GuardedWriteError::ValidationFailed)
+        );
+        handle
+            .try_write_user_input(Bytes::from_static(b"after"))
+            .expect("ordinary writer remains usable");
+        let mut after = [0; 5];
+        peer.read_exact(&mut after)
+            .expect("peer receives later ordinary input");
+        assert_eq!(&after, b"after");
         handle.shutdown();
     }
 
@@ -1106,6 +1761,31 @@ mod tests {
     }
 
     #[test]
+    fn output_boundary_does_not_read_while_actor_is_quiesced() {
+        let (handle, mut peer, read_rx) = actor_with_socket_pair(false);
+        handle
+            .begin_handoff(Duration::from_secs(1))
+            .expect("handoff quiesced");
+        peer.write_all(b"held during handoff")
+            .expect("peer write during quiesce");
+
+        assert_eq!(handle.drain_output_boundary(), Err(GuardedWriteError::Busy));
+        assert!(
+            read_rx.recv_timeout(Duration::from_millis(150)).is_err(),
+            "output boundary must preserve quiesced unread bytes"
+        );
+
+        handle.rollback_handoff().expect("rollback resumes actor");
+        assert_eq!(
+            read_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("held bytes read after rollback"),
+            Bytes::from_static(b"held during handoff")
+        );
+        handle.shutdown();
+    }
+
+    #[test]
     fn duplicate_for_handoff_requires_quiesced_actor() {
         let (handle, mut peer, read_rx) = actor_with_socket_pair(false);
 
@@ -1145,7 +1825,7 @@ mod tests {
             data_tx,
             control_tx,
             wake,
-            user_writes: Arc::new(Mutex::new(UserWriteGate { accepting: true })),
+            user_writes: test_user_write_gate(),
             controls: Arc::clone(&controls),
             response_order: Arc::new(Mutex::new(())),
         };
@@ -1208,6 +1888,7 @@ mod tests {
             wake_read_fd: wake_pipe.read_fd,
             controls: Arc::clone(&controls),
             response_order: Arc::clone(&response_order),
+            user_writes: test_user_write_gate(),
             on_read: Box::new(move |_| PtyReadResult {
                 terminal_responses: vec![if query_light.load(Ordering::Acquire) {
                     Bytes::from_static(b"query-light")
@@ -1222,7 +1903,7 @@ mod tests {
             data_tx,
             control_tx,
             wake: wake_pipe.writer,
-            user_writes: Arc::new(Mutex::new(UserWriteGate { accepting: true })),
+            user_writes: test_user_write_gate(),
             controls,
             response_order,
         };
@@ -1248,8 +1929,14 @@ mod tests {
         appearance.join().expect("appearance thread joins");
         let runner = reader.join().expect("reader thread joins");
 
+        let pending_bytes = runner
+            .pending_writes
+            .iter()
+            .map(PendingWrite::bytes)
+            .cloned()
+            .collect::<VecDeque<_>>();
         assert_eq!(
-            runner.pending_writes,
+            pending_bytes,
             VecDeque::from([
                 Bytes::from_static(b"live-light"),
                 Bytes::from_static(b"query-light"),
@@ -1285,7 +1972,7 @@ mod tests {
             data_tx,
             control_tx,
             wake,
-            user_writes: Arc::new(Mutex::new(UserWriteGate { accepting: true })),
+            user_writes: test_user_write_gate(),
             controls: Arc::new(Mutex::new(SharedPtyControls::default())),
             response_order: Arc::new(Mutex::new(())),
         };
@@ -1331,7 +2018,7 @@ mod tests {
             data_tx,
             control_tx,
             wake,
-            user_writes: Arc::new(Mutex::new(UserWriteGate { accepting: true })),
+            user_writes: test_user_write_gate(),
             controls: Arc::new(Mutex::new(SharedPtyControls::default())),
             response_order: Arc::new(Mutex::new(())),
         };
@@ -1386,7 +2073,7 @@ mod tests {
             data_tx,
             control_tx,
             wake,
-            user_writes: Arc::new(Mutex::new(UserWriteGate { accepting: true })),
+            user_writes: test_user_write_gate(),
             controls: Arc::new(Mutex::new(SharedPtyControls::default())),
             response_order: Arc::new(Mutex::new(())),
         };
@@ -1434,6 +2121,7 @@ mod tests {
             wake_read_fd: fd::create_wake_pipe().expect("wake pipe").read_fd,
             controls: Arc::new(Mutex::new(SharedPtyControls::default())),
             response_order: Arc::new(Mutex::new(())),
+            user_writes: test_user_write_gate(),
             on_read: Box::new(|_| PtyReadResult::empty()),
             on_reader_exit: None,
             poll_observer: None,

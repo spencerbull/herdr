@@ -438,6 +438,78 @@ pub(super) struct AgentProcessInstance {
     pub(super) process_group_id: Option<u32>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentProcessIdentificationProvenance {
+    Executable,
+    EnvironmentHint,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AgentProcessIdentification {
+    agent: crate::detect::Agent,
+    pid: u32,
+    provenance: AgentProcessIdentificationProvenance,
+}
+
+fn identify_agent_process_in_job_with_provenance(
+    job: &crate::platform::ForegroundJob,
+    read_hint: impl Fn(u32) -> Option<crate::detect::Agent>,
+) -> Option<AgentProcessIdentification> {
+    if let Some((agent, _, pid)) = crate::detect::identify_agent_process_in_job(job) {
+        return Some(AgentProcessIdentification {
+            agent,
+            pid,
+            provenance: AgentProcessIdentificationProvenance::Executable,
+        });
+    }
+
+    job.processes.iter().find_map(|process| {
+        read_hint(process.pid).map(|agent| AgentProcessIdentification {
+            agent,
+            pid: process.pid,
+            provenance: AgentProcessIdentificationProvenance::EnvironmentHint,
+        })
+    })
+}
+
+fn trusted_agent_process_instance_in_job(
+    job: &crate::platform::ForegroundJob,
+    expected: crate::detect::Agent,
+    read_hint: impl Fn(u32) -> Option<crate::detect::Agent>,
+    process_start_identity: impl Fn(u32) -> Option<u128>,
+) -> Option<AgentProcessInstance> {
+    let identified = identify_agent_process_in_job_with_provenance(job, read_hint)?;
+    if identified.agent != expected
+        || identified.provenance != AgentProcessIdentificationProvenance::Executable
+    {
+        return None;
+    }
+
+    #[cfg(unix)]
+    let process_group_id = Some(job.process_group_id);
+    #[cfg(not(unix))]
+    let process_group_id = None;
+
+    Some(AgentProcessInstance {
+        pid: identified.pid,
+        start_identity: process_start_identity(identified.pid)?,
+        process_group_id,
+    })
+}
+
+fn agent_process_instance_for_child_pid(
+    child_pid: u32,
+    expected: crate::detect::Agent,
+) -> Option<AgentProcessInstance> {
+    let job = crate::detect::foreground_job(child_pid)?;
+    trusted_agent_process_instance_in_job(
+        &job,
+        expected,
+        crate::platform::process_agent_hint,
+        crate::platform::process_start_identity,
+    )
+}
+
 pub(super) fn runtime_agent_process_instance(
     runtime: &crate::terminal::TerminalRuntime,
     expected: crate::detect::Agent,
@@ -451,27 +523,32 @@ pub(super) fn runtime_agent_process_instance(
         });
     }
 
-    let job = crate::detect::foreground_job(runtime.child_pid()?)?;
-    let (agent, pid) = crate::detect::identify_agent_process_in_job(&job)
-        .map(|(agent, _, pid)| (agent, pid))
-        .or_else(|| {
-            job.processes.iter().find_map(|process| {
-                crate::platform::process_agent_hint(process.pid).map(|agent| (agent, process.pid))
-            })
-        })?;
-    if agent != expected {
-        return None;
+    agent_process_instance_for_child_pid(runtime.child_pid()?, expected)
+}
+
+pub(super) fn runtime_agent_process_validator(
+    runtime: &crate::terminal::TerminalRuntime,
+    expected: crate::detect::Agent,
+    expected_instance: AgentProcessInstance,
+) -> crate::pty::actor::GuardedWriteValidator {
+    #[cfg(test)]
+    if runtime.child_pid().is_none() {
+        let start_identity = runtime.test_agent_process_start_identity_handle();
+        return std::sync::Arc::new(move || {
+            expected_instance.pid == 1
+                && expected_instance.process_group_id == Some(1)
+                && expected_instance.start_identity
+                    == u128::from(start_identity.load(std::sync::atomic::Ordering::Acquire))
+        });
     }
 
-    #[cfg(unix)]
-    let process_group_id = Some(job.process_group_id);
-    #[cfg(not(unix))]
-    let process_group_id = None;
-
-    Some(AgentProcessInstance {
-        pid,
-        start_identity: crate::platform::process_start_identity(pid)?,
-        process_group_id,
+    let child_pid = runtime.child_pid_handle();
+    std::sync::Arc::new(move || {
+        let pid = child_pid.load(std::sync::atomic::Ordering::Acquire);
+        (pid > 0)
+            .then(|| agent_process_instance_for_child_pid(pid, expected))
+            .flatten()
+            == Some(expected_instance)
     })
 }
 
@@ -514,7 +591,28 @@ pub(super) enum AgentRenameError {
 
 #[cfg(test)]
 mod tests {
-    use super::valid_agent_name;
+    use super::{
+        identify_agent_process_in_job_with_provenance, trusted_agent_process_instance_in_job,
+        valid_agent_name, AgentProcessIdentificationProvenance, AgentProcessInstance,
+    };
+
+    fn foreground_process(
+        pid: u32,
+        name: &str,
+        argv: &[&str],
+    ) -> crate::platform::ForegroundProcess {
+        crate::platform::ForegroundProcess {
+            pid,
+            name: name.to_string(),
+            argv0: None,
+            argv: Some(
+                argv.iter()
+                    .map(|argument| (*argument).to_string())
+                    .collect(),
+            ),
+            cmdline: Some(argv.join(" ")),
+        }
+    }
 
     #[test]
     fn agent_names_use_a_small_cli_safe_grammar() {
@@ -533,5 +631,54 @@ mod tests {
         ] {
             assert!(!valid_agent_name(name), "expected {name:?} to be invalid");
         }
+    }
+
+    #[test]
+    fn guarded_process_identity_rejects_environment_hint_only_wrappers() {
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 41,
+            processes: vec![foreground_process(41, "fence", &["fence"])],
+        };
+        let identified = identify_agent_process_in_job_with_provenance(&job, |_| {
+            Some(crate::detect::Agent::Codex)
+        })
+        .expect("environment hint identifies presentation agent");
+        assert_eq!(
+            identified.provenance,
+            AgentProcessIdentificationProvenance::EnvironmentHint
+        );
+        assert!(trusted_agent_process_instance_in_job(
+            &job,
+            crate::detect::Agent::Codex,
+            |_| Some(crate::detect::Agent::Codex),
+            |_| Some(99),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn guarded_process_identity_accepts_exact_executable_provenance() {
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 42,
+            processes: vec![foreground_process(42, "codex", &["codex"])],
+        };
+        #[cfg(unix)]
+        let expected_process_group_id = Some(42);
+        #[cfg(not(unix))]
+        let expected_process_group_id = None;
+
+        assert_eq!(
+            trusted_agent_process_instance_in_job(
+                &job,
+                crate::detect::Agent::Codex,
+                |_| None,
+                |_| Some(1234),
+            ),
+            Some(AgentProcessInstance {
+                pid: 42,
+                start_identity: 1234,
+                process_group_id: expected_process_group_id,
+            })
+        );
     }
 }

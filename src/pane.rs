@@ -21,7 +21,10 @@ use tracing::{error, info, warn};
 use crate::detect::{Agent, AgentState};
 use crate::events::AppEvent;
 use crate::layout::PaneId;
-use crate::pty::actor::{PtyIoActor, PtyIoActorConfig, PtyIoActorHandle, PtyReadResult};
+use crate::pty::actor::{
+    GuardedWriteError, GuardedWriteValidator, PtyIoActor, PtyIoActorConfig, PtyIoActorHandle,
+    PtyReadResult,
+};
 use crate::render_signal::RenderSignal;
 
 mod agent_detection;
@@ -1135,7 +1138,11 @@ pub struct PaneRuntime {
     pending_release: Arc<Mutex<Option<PendingAgentRelease>>>,
     preserve_processes_on_drop: bool,
     #[cfg(test)]
-    test_agent_process_start_identity: AtomicU64,
+    test_agent_process_start_identity: Arc<AtomicU64>,
+    #[cfg(test)]
+    test_replace_agent_before_guarded_write: AtomicBool,
+    #[cfg(test)]
+    test_output_boundary_bytes: Mutex<Option<Vec<u8>>>,
     // Task handles for deterministic shutdown
     detect_handle: Option<tokio::task::AbortHandle>,
 }
@@ -1281,6 +1288,26 @@ impl PaneRuntimeIo {
         }
     }
 
+    fn write_guarded(
+        &self,
+        bytes: Bytes,
+        validate: GuardedWriteValidator,
+    ) -> Result<(), GuardedWriteError> {
+        match self {
+            PaneRuntimeIo::Actor(actor) => actor.write_guarded(bytes, validate),
+            #[cfg(test)]
+            PaneRuntimeIo::TestChannel { sender, .. } => {
+                if !validate() {
+                    return Err(GuardedWriteError::ValidationFailed);
+                }
+                sender.try_send(bytes).map_err(|err| match err {
+                    mpsc::error::TrySendError::Full(_) => GuardedWriteError::Busy,
+                    mpsc::error::TrySendError::Closed(_) => GuardedWriteError::Closed,
+                })
+            }
+        }
+    }
+
     fn send_bytes_after(&self, bytes: Bytes, delay: std::time::Duration) {
         match self {
             PaneRuntimeIo::Actor(actor) => {
@@ -1300,6 +1327,22 @@ impl PaneRuntimeIo {
                     let _ = sender.send(bytes).await;
                 });
             }
+        }
+    }
+
+    fn guarded_writes_supported(&self) -> bool {
+        match self {
+            PaneRuntimeIo::Actor(actor) => actor.guarded_writes_supported(),
+            #[cfg(test)]
+            PaneRuntimeIo::TestChannel { .. } => true,
+        }
+    }
+
+    fn drain_output_boundary(&self) -> Result<(), GuardedWriteError> {
+        match self {
+            PaneRuntimeIo::Actor(actor) => actor.drain_output_boundary(),
+            #[cfg(test)]
+            PaneRuntimeIo::TestChannel { .. } => Ok(()),
         }
     }
 }
@@ -2098,7 +2141,11 @@ impl PaneRuntime {
             pending_release,
             preserve_processes_on_drop: true,
             #[cfg(test)]
-            test_agent_process_start_identity: AtomicU64::new(1),
+            test_agent_process_start_identity: Arc::new(AtomicU64::new(1)),
+            #[cfg(test)]
+            test_replace_agent_before_guarded_write: AtomicBool::new(false),
+            #[cfg(test)]
+            test_output_boundary_bytes: Mutex::new(None),
             detect_handle: Some(detect_handle),
         })
     }
@@ -2669,7 +2716,11 @@ impl PaneRuntime {
             pending_release,
             preserve_processes_on_drop: false,
             #[cfg(test)]
-            test_agent_process_start_identity: AtomicU64::new(1),
+            test_agent_process_start_identity: Arc::new(AtomicU64::new(1)),
+            #[cfg(test)]
+            test_replace_agent_before_guarded_write: AtomicBool::new(false),
+            #[cfg(test)]
+            test_output_boundary_bytes: Mutex::new(None),
             detect_handle,
         })
     }
@@ -2868,6 +2919,49 @@ impl PaneRuntime {
         self.detection_content_seq.load(Ordering::Acquire)
     }
 
+    pub(crate) fn guarded_detection_validator(
+        &self,
+        expected_agent: Agent,
+        expected_content_seq: u64,
+        expected_screen: String,
+        expected_osc_title: String,
+        expected_osc_progress: String,
+    ) -> GuardedWriteValidator {
+        let terminal = Arc::clone(&self.terminal);
+        let detection_content_seq = Arc::clone(&self.detection_content_seq);
+        Arc::new(move || {
+            for _ in 0..3 {
+                let before = detection_content_seq.load(Ordering::Acquire);
+                if before != expected_content_seq {
+                    return false;
+                }
+                let screen = terminal.detection_text();
+                let osc_title = terminal.agent_osc_title();
+                let osc_progress = terminal.agent_osc_progress();
+                let after = detection_content_seq.load(Ordering::Acquire);
+                if before != after {
+                    continue;
+                }
+                if screen != expected_screen
+                    || osc_title != expected_osc_title
+                    || osc_progress != expected_osc_progress
+                {
+                    return false;
+                }
+                return crate::detect::manifest::trusted_interrupt_evidence(
+                    expected_agent,
+                    crate::detect::manifest::DetectionInput {
+                        screen: &screen,
+                        osc_title: &osc_title,
+                        osc_progress: &osc_progress,
+                    },
+                )
+                .is_some();
+            }
+            false
+        })
+    }
+
     pub fn terminal_title(&self) -> Option<String> {
         self.terminal.terminal_title()
     }
@@ -2958,6 +3052,38 @@ impl PaneRuntime {
 
     pub fn send_bytes_after(&self, bytes: Bytes, delay: std::time::Duration) {
         self.io.send_bytes_after(bytes, delay);
+    }
+
+    pub(crate) fn write_guarded(
+        &self,
+        bytes: Bytes,
+        validate: GuardedWriteValidator,
+    ) -> Result<(), GuardedWriteError> {
+        #[cfg(test)]
+        if self
+            .test_replace_agent_before_guarded_write
+            .swap(false, Ordering::AcqRel)
+        {
+            self.test_replace_agent_process_instance();
+        }
+        self.io.write_guarded(bytes, validate)
+    }
+
+    pub(crate) fn guarded_writes_supported(&self) -> bool {
+        self.io.guarded_writes_supported()
+    }
+
+    pub(crate) fn drain_output_boundary(&self) -> Result<(), GuardedWriteError> {
+        #[cfg(test)]
+        if let Some(bytes) = self
+            .test_output_boundary_bytes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            self.test_process_pty_bytes(&bytes);
+        }
+        self.io.drain_output_boundary()
     }
 
     pub async fn send_paste(&self, text: String) -> Result<(), mpsc::error::SendError<Bytes>> {
@@ -3084,6 +3210,10 @@ impl PaneRuntime {
         (pid > 0).then_some(pid)
     }
 
+    pub(crate) fn child_pid_handle(&self) -> Arc<AtomicU32> {
+        Arc::clone(&self.child_pid)
+    }
+
     #[cfg(test)]
     pub(crate) fn test_agent_process_start_identity(&self) -> u64 {
         self.test_agent_process_start_identity
@@ -3091,9 +3221,33 @@ impl PaneRuntime {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_agent_process_start_identity_handle(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.test_agent_process_start_identity)
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_replace_agent_process_instance(&self) {
         self.test_agent_process_start_identity
             .fetch_add(1, Ordering::AcqRel);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_replace_agent_at_guarded_write_boundary(&self) {
+        self.test_replace_agent_before_guarded_write
+            .store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_advance_detection_content_seq(&self) {
+        mark_detection_content_changed(&self.detection_content_seq);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_emit_bytes_at_output_boundary(&self, bytes: Vec<u8>) {
+        *self
+            .test_output_boundary_bytes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(bytes);
     }
 
     pub fn follow_cwd(&self) -> Option<std::path::PathBuf> {
@@ -3208,7 +3362,9 @@ impl PaneRuntime {
                 detect_reset_notify: Arc::new(Notify::new()),
                 pending_release: Arc::new(Mutex::new(None)),
                 preserve_processes_on_drop: true,
-                test_agent_process_start_identity: AtomicU64::new(1),
+                test_agent_process_start_identity: Arc::new(AtomicU64::new(1)),
+                test_replace_agent_before_guarded_write: AtomicBool::new(false),
+                test_output_boundary_bytes: Mutex::new(None),
                 detect_handle: Some(tokio::spawn(async {}).abort_handle()),
             },
             rx,
@@ -3853,7 +4009,9 @@ mod tests {
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
             preserve_processes_on_drop: true,
-            test_agent_process_start_identity: AtomicU64::new(1),
+            test_agent_process_start_identity: Arc::new(AtomicU64::new(1)),
+            test_replace_agent_before_guarded_write: AtomicBool::new(false),
+            test_output_boundary_bytes: Mutex::new(None),
             detect_handle: Some(tokio::spawn(async {}).abort_handle()),
         };
 
@@ -3886,7 +4044,9 @@ mod tests {
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
             preserve_processes_on_drop: true,
-            test_agent_process_start_identity: AtomicU64::new(1),
+            test_agent_process_start_identity: Arc::new(AtomicU64::new(1)),
+            test_replace_agent_before_guarded_write: AtomicBool::new(false),
+            test_output_boundary_bytes: Mutex::new(None),
             detect_handle: Some(tokio::spawn(async {}).abort_handle()),
         };
 

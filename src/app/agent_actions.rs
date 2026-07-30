@@ -30,6 +30,7 @@ pub(crate) struct AgentActionRegistry {
 struct AgentActionRegistryInner {
     active: HashMap<String, StoredAgentActionCapability>,
     slots: HashMap<AgentActionSlot, AgentActionSlotState>,
+    process_evidence: HashMap<String, AgentActionProcessEvidenceState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -43,6 +44,20 @@ struct AgentActionSlotState {
     binding_digest: [u8; 32],
     capability_id: String,
     consumed: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AgentActionProcessEvidenceState {
+    process_instance: super::agents::AgentProcessInstance,
+    detection_content_baseline: u64,
+    freshness: AgentActionEvidenceFreshness,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentActionEvidenceFreshness {
+    AwaitingAbsence,
+    AwaitingReturn,
+    Ready,
 }
 
 #[derive(Clone)]
@@ -181,6 +196,91 @@ impl AgentActionRegistry {
         Some(stored)
     }
 
+    fn process_boundary_required(
+        &self,
+        terminal_id: &str,
+        process_instance: super::agents::AgentProcessInstance,
+    ) -> bool {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner
+            .process_evidence
+            .get(terminal_id)
+            .is_none_or(|state| state.process_instance != process_instance)
+    }
+
+    fn record_process_boundary(
+        &self,
+        terminal_id: &str,
+        process_instance: super::agents::AgentProcessInstance,
+        detection_content_seq: u64,
+        trusted_evidence_present: bool,
+    ) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.process_evidence.insert(
+            terminal_id.to_string(),
+            AgentActionProcessEvidenceState {
+                process_instance,
+                detection_content_baseline: detection_content_seq,
+                freshness: if trusted_evidence_present {
+                    AgentActionEvidenceFreshness::AwaitingAbsence
+                } else {
+                    AgentActionEvidenceFreshness::AwaitingReturn
+                },
+            },
+        );
+    }
+
+    fn process_evidence_is_fresh(
+        &self,
+        terminal_id: &str,
+        process_instance: super::agents::AgentProcessInstance,
+        detection_content_seq: u64,
+        trusted_evidence_present: bool,
+    ) -> bool {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(state) = inner.process_evidence.get_mut(terminal_id) else {
+            return false;
+        };
+        if state.process_instance != process_instance {
+            return false;
+        }
+
+        match state.freshness {
+            AgentActionEvidenceFreshness::AwaitingAbsence => {
+                if !trusted_evidence_present
+                    && state.detection_content_baseline != detection_content_seq
+                {
+                    state.freshness = AgentActionEvidenceFreshness::AwaitingReturn;
+                }
+                state.detection_content_baseline = detection_content_seq;
+                false
+            }
+            AgentActionEvidenceFreshness::AwaitingReturn => {
+                let evidence_advanced = state.detection_content_baseline != detection_content_seq;
+                state.detection_content_baseline = detection_content_seq;
+                if trusted_evidence_present && evidence_advanced {
+                    state.freshness = AgentActionEvidenceFreshness::Ready;
+                    true
+                } else {
+                    false
+                }
+            }
+            AgentActionEvidenceFreshness::Ready => {
+                state.detection_content_baseline = detection_content_seq;
+                trusted_evidence_present
+            }
+        }
+    }
+
     pub(crate) fn remove_terminal(&self, terminal_id: &str) {
         let mut inner = self
             .inner
@@ -192,6 +292,7 @@ impl AgentActionRegistry {
         inner
             .slots
             .retain(|slot, _| slot.terminal_id != terminal_id);
+        inner.process_evidence.remove(terminal_id);
     }
 
     #[cfg(test)]
@@ -212,6 +313,15 @@ impl AgentActionRegistry {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         (inner.active.len(), inner.slots.len())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn process_evidence_count_for_test(&self) -> usize {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.process_evidence.len()
     }
 }
 
@@ -374,31 +484,43 @@ impl App {
         let runtime = self
             .lookup_runtime_sender(resolved.ws_idx, resolved.pane_id)
             .ok_or_else(stale_capability_error)?;
-        if runtime.detection_content_seq() != stored.binding.detection_content_seq {
-            return Err(stale_capability_error());
-        }
-        let key = match stored.binding.action {
-            AgentActionKind::Approve => "enter",
-            AgentActionKind::Interrupt => "esc",
-        };
-        let encoded = super::api_helpers::encode_api_keys(runtime, &[key.to_string()])
-            .map_err(|_| stale_capability_error())?;
-        let bytes: Vec<u8> = encoded.into_iter().flatten().collect();
-        if runtime.detection_content_seq() != stored.binding.detection_content_seq {
-            return Err(stale_capability_error());
-        }
-        if super::agents::runtime_agent_process_instance(runtime, stored.binding.expected_agent)
-            != Some(stored.binding.process_instance)
+        let writer_snapshot =
+            capture_detection_snapshot(runtime).ok_or_else(stale_capability_error)?;
+        if writer_snapshot.content_seq != stored.binding.detection_content_seq
+            || writer_snapshot.fingerprint != stored.binding.screen_fingerprint
         {
             return Err(stale_capability_error());
         }
+        let bytes = guarded_action_bytes(stored.binding.action);
+
+        let detection_validator = runtime.guarded_detection_validator(
+            stored.binding.expected_agent,
+            writer_snapshot.content_seq,
+            writer_snapshot.screen,
+            writer_snapshot.osc_title,
+            writer_snapshot.osc_progress,
+        );
+        let process_validator = super::agents::runtime_agent_process_validator(
+            runtime,
+            stored.binding.expected_agent,
+            stored.binding.process_instance,
+        );
+        let expires_at = stored.expires_at;
+        let writer_validator: crate::pty::actor::GuardedWriteValidator =
+            std::sync::Arc::new(move || {
+                Instant::now() < expires_at && process_validator() && detection_validator()
+            });
+
         runtime
-            .try_send_bytes(Bytes::from(bytes))
-            .map_err(|err| ErrorBody {
-                code: "agent_action_failed".into(),
-                message: format!(
-                    "agent action input could not be queued and will not be retried: {err}"
-                ),
+            .write_guarded(bytes, writer_validator)
+            .map_err(|err| match err {
+                crate::pty::actor::GuardedWriteError::ValidationFailed => stale_capability_error(),
+                _ => ErrorBody {
+                    code: "agent_action_failed".into(),
+                    message: format!(
+                        "guarded agent action could not be written and will not be retried: {err}"
+                    ),
+                },
             })?;
         Ok(stored.public)
     }
@@ -417,9 +539,39 @@ impl App {
         }
         let expected_agent = terminal.effective_known_agent()?;
         let runtime = self.lookup_runtime_sender(ws_idx, pane_id)?;
+        if !runtime.guarded_writes_supported() {
+            return None;
+        }
         let process_instance =
             super::agents::runtime_agent_process_instance(runtime, expected_agent)?;
         if pane.agent_status != AgentStatus::Working {
+            return None;
+        }
+        if self
+            .agent_action_registry
+            .process_boundary_required(&pane.terminal_id, process_instance)
+        {
+            runtime.drain_output_boundary().ok()?;
+            if super::agents::runtime_agent_process_instance(runtime, expected_agent)
+                != Some(process_instance)
+            {
+                return None;
+            }
+            let boundary_snapshot = capture_detection_snapshot(runtime)?;
+            let boundary_evidence = crate::detect::manifest::trusted_interrupt_evidence(
+                expected_agent,
+                DetectionInput {
+                    screen: &boundary_snapshot.screen,
+                    osc_title: &boundary_snapshot.osc_title,
+                    osc_progress: &boundary_snapshot.osc_progress,
+                },
+            );
+            self.agent_action_registry.record_process_boundary(
+                &pane.terminal_id,
+                process_instance,
+                boundary_snapshot.content_seq,
+                boundary_evidence.is_some(),
+            );
             return None;
         }
         let snapshot = capture_detection_snapshot(runtime)?;
@@ -430,7 +582,16 @@ impl App {
                 osc_title: &snapshot.osc_title,
                 osc_progress: &snapshot.osc_progress,
             },
-        )?;
+        );
+        if !self.agent_action_registry.process_evidence_is_fresh(
+            &pane.terminal_id,
+            process_instance,
+            snapshot.content_seq,
+            evidence.is_some(),
+        ) {
+            return None;
+        }
+        let evidence = evidence?;
         // Approval remains intentionally unavailable until a current agent UI
         // has an action-specific prompt rule verified from a live screen.
         Some(AgentActionBinding {
@@ -510,6 +671,13 @@ fn action_label(action: AgentActionKind) -> &'static str {
     }
 }
 
+fn guarded_action_bytes(action: AgentActionKind) -> Bytes {
+    match action {
+        AgentActionKind::Approve => Bytes::from_static(b"\r"),
+        AgentActionKind::Interrupt => Bytes::from_static(b"\x1b"),
+    }
+}
+
 fn status_label(status: AgentStatus) -> &'static str {
     match status {
         AgentStatus::Idle => "idle",
@@ -525,5 +693,22 @@ fn stale_capability_error() -> ErrorBody {
         code: "agent_action_capability_stale".into(),
         message: "agent action capability no longer matches the live agent, pane, state, or screen"
             .into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{guarded_action_bytes, AgentActionKind};
+
+    #[test]
+    fn guarded_action_bytes_are_single_byte_and_terminal_protocol_independent() {
+        assert_eq!(
+            guarded_action_bytes(AgentActionKind::Approve),
+            bytes::Bytes::from_static(b"\r")
+        );
+        assert_eq!(
+            guarded_action_bytes(AgentActionKind::Interrupt),
+            bytes::Bytes::from_static(b"\x1b")
+        );
     }
 }
