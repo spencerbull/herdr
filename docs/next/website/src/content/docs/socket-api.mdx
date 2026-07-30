@@ -827,9 +827,13 @@ process's screen: on the first process observation and every replacement, Herdr
 drains buffered PTY output, rechecks the exact process, and only then records the
 detection baseline. Trusted evidence already visible at that boundary must
 disappear and later reappear before a capability can be issued. Evidence first
-painted after an evidence-free boundary can qualify normally. Environment hints
-can identify an agent for presentation, but cannot establish the exact
-executable identity required by a guarded action.
+painted after an evidence-free boundary can qualify normally. Only actual PTY
+output advances this process-evidence freshness; a local resize or reflow can
+invalidate an existing capability but cannot make inherited evidence fresh. An
+in-place `exec` that preserves PID and process-start identity is process
+continuity, not a detected replacement boundary. Environment hints can identify
+an agent for presentation, but cannot establish the exact executable identity
+required by a guarded action.
 
 The remaining race is the final writer-boundary validation return to the
 one-byte PTY write syscall; the external process can still change in that

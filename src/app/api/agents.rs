@@ -449,6 +449,12 @@ No, and tell Codex what to do differently\n"
             .unwrap()
             .clone();
         let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_detected_state(Some(Agent::Omp), AgentState::Working);
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:omp".into(),
+            agent: "omp".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("omp-root").unwrap(),
+        });
         terminal.set_hook_authority(
             "herdr:omp".into(),
             "omp".into(),

@@ -373,6 +373,10 @@ impl TerminalRuntime {
         self.0.detection_content_seq()
     }
 
+    pub(crate) fn pty_output_seq(&self) -> u64 {
+        self.0.pty_output_seq()
+    }
+
     pub(crate) fn guarded_detection_validator(
         &self,
         expected_agent: crate::detect::Agent,

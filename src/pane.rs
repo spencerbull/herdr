@@ -74,6 +74,12 @@ pub(crate) fn aggregate_input_state_reads() -> usize {
     AGGREGATE_INPUT_STATE_READS.get()
 }
 
+fn observe_pty_output(bytes: &[u8], pty_output_seq: &AtomicU64) {
+    if !bytes.is_empty() {
+        pty_output_seq.fetch_add(1, Ordering::Release);
+    }
+}
+
 fn apply_pane_terminal_env(cmd: &mut CommandBuilder) {
     // Each pane is rendered by herdr's own terminal layer, not the outer terminal
     // that launched the app. Advertising the inherited TERM leaks the host terminal
@@ -1133,6 +1139,7 @@ pub struct PaneRuntime {
     kitty_keyboard_flags: Arc<AtomicU16>,
     content_seq: Arc<AtomicU64>,
     detection_content_seq: Arc<AtomicU64>,
+    pty_output_seq: Arc<AtomicU64>,
     full_lifecycle_authority_active: Arc<AtomicBool>,
     detect_reset_notify: Arc<Notify>,
     pending_release: Arc<Mutex<Option<PendingAgentRelease>>>,
@@ -2048,6 +2055,7 @@ impl PaneRuntime {
         let kitty_keyboard_flags = Arc::new(AtomicU16::new(keyboard_protocol_flags));
         let content_seq = Arc::new(AtomicU64::new(0));
         let detection_content_seq = Arc::new(AtomicU64::new(0));
+        let pty_output_seq = Arc::new(AtomicU64::new(0));
 
         let io = {
             let terminal = terminal.clone();
@@ -2056,6 +2064,7 @@ impl PaneRuntime {
             let render_dirty = render_dirty.clone();
             let content_seq = content_seq.clone();
             let detection_content_seq = detection_content_seq.clone();
+            let pty_output_seq = pty_output_seq.clone();
             let child_pid = child_pid.clone();
             let read_events = events.clone();
             let reported_cwd = reported_cwd.clone();
@@ -2069,6 +2078,7 @@ impl PaneRuntime {
                 content_seq.fetch_add(1, Ordering::Release);
                 publish_terminal_bells(pane_id, result.terminal_bells, &read_events);
                 observe_detection_content_change(bytes, &detection_content_seq);
+                observe_pty_output(bytes, &pty_output_seq);
                 let title_requested =
                     result.terminal_title_changed && render_dirty.request_terminal_title(pane_id);
                 let render_requested = result.request_render && render_dirty.request_pty(pane_id);
@@ -2136,6 +2146,7 @@ impl PaneRuntime {
             kitty_keyboard_flags,
             content_seq,
             detection_content_seq,
+            pty_output_seq,
             full_lifecycle_authority_active,
             detect_reset_notify,
             pending_release,
@@ -2198,6 +2209,7 @@ impl PaneRuntime {
         let child_wait_completed = Arc::new(AtomicBool::new(false));
         let content_seq = Arc::new(AtomicU64::new(0));
         let detection_content_seq = Arc::new(AtomicU64::new(0));
+        let pty_output_seq = Arc::new(AtomicU64::new(0));
         let full_lifecycle_authority_active = Arc::new(AtomicBool::new(false));
         {
             let child_pid = child_pid.clone();
@@ -2232,6 +2244,7 @@ impl PaneRuntime {
             let render_dirty = render_dirty.clone();
             let content_seq = content_seq.clone();
             let detection_content_seq = detection_content_seq.clone();
+            let pty_output_seq = pty_output_seq.clone();
             let child_pid = child_pid.clone();
             let events = events.clone();
             let reported_cwd = reported_cwd.clone();
@@ -2246,6 +2259,7 @@ impl PaneRuntime {
                 if agent_detection == AgentDetection::Enabled {
                     observe_detection_content_change(bytes, &detection_content_seq);
                 }
+                observe_pty_output(bytes, &pty_output_seq);
                 let title_requested =
                     result.terminal_title_changed && render_dirty.request_terminal_title(pane_id);
                 let render_requested = result.request_render && render_dirty.request_pty(pane_id);
@@ -2711,6 +2725,7 @@ impl PaneRuntime {
             kitty_keyboard_flags,
             content_seq,
             detection_content_seq,
+            pty_output_seq,
             full_lifecycle_authority_active,
             detect_reset_notify,
             pending_release,
@@ -2917,6 +2932,10 @@ impl PaneRuntime {
 
     pub(crate) fn detection_content_seq(&self) -> u64 {
         self.detection_content_seq.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn pty_output_seq(&self) -> u64 {
+        self.pty_output_seq.load(Ordering::Acquire)
     }
 
     pub(crate) fn guarded_detection_validator(
@@ -3317,6 +3336,7 @@ impl PaneRuntime {
         let _ = self.terminal.process_pty_bytes(self.pane_id, 0, bytes, &tx);
         self.content_seq.fetch_add(1, Ordering::Release);
         observe_detection_content_change(bytes, &self.detection_content_seq);
+        observe_pty_output(bytes, &self.pty_output_seq);
     }
 
     pub(crate) fn test_with_scrollback_bytes(
@@ -3358,6 +3378,7 @@ impl PaneRuntime {
                 kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
                 content_seq: Arc::new(AtomicU64::new(0)),
                 detection_content_seq: Arc::new(AtomicU64::new(0)),
+                pty_output_seq: Arc::new(AtomicU64::new(0)),
                 full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
                 detect_reset_notify: Arc::new(Notify::new()),
                 pending_release: Arc::new(Mutex::new(None)),
@@ -3469,6 +3490,20 @@ mod tests {
 
         assert!(event_rx.try_recv().is_err());
         assert!(last.is_none());
+    }
+
+    #[tokio::test]
+    async fn resize_does_not_advance_pty_output_sequence() {
+        let runtime = PaneRuntime::test_with_screen_bytes(80, 24, b"visible footer");
+        let detection_before = runtime.detection_content_seq();
+        let output_before = runtime.pty_output_seq();
+
+        runtime.resize(24, 79, 0, 0);
+
+        assert!(runtime.detection_content_seq() > detection_before);
+        assert_eq!(runtime.pty_output_seq(), output_before);
+        runtime.test_process_pty_bytes(b"real output");
+        assert!(runtime.pty_output_seq() > output_before);
     }
 
     #[tokio::test]
@@ -4005,6 +4040,7 @@ mod tests {
             kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
             content_seq: Arc::new(AtomicU64::new(0)),
             detection_content_seq: Arc::new(AtomicU64::new(0)),
+            pty_output_seq: Arc::new(AtomicU64::new(0)),
             full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
@@ -4040,6 +4076,7 @@ mod tests {
             kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
             content_seq: Arc::new(AtomicU64::new(0)),
             detection_content_seq: Arc::new(AtomicU64::new(0)),
+            pty_output_seq: Arc::new(AtomicU64::new(0)),
             full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),

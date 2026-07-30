@@ -49,7 +49,7 @@ struct AgentActionSlotState {
 #[derive(Debug, Clone, Copy)]
 struct AgentActionProcessEvidenceState {
     process_instance: super::agents::AgentProcessInstance,
-    detection_content_baseline: u64,
+    pty_output_baseline: u64,
     freshness: AgentActionEvidenceFreshness,
 }
 
@@ -98,6 +98,7 @@ struct DetectionSnapshot {
     osc_title: String,
     osc_progress: String,
     content_seq: u64,
+    pty_output_seq: u64,
     fingerprint: [u8; 32],
 }
 
@@ -215,7 +216,7 @@ impl AgentActionRegistry {
         &self,
         terminal_id: &str,
         process_instance: super::agents::AgentProcessInstance,
-        detection_content_seq: u64,
+        pty_output_seq: u64,
         trusted_evidence_present: bool,
     ) {
         let mut inner = self
@@ -226,7 +227,7 @@ impl AgentActionRegistry {
             terminal_id.to_string(),
             AgentActionProcessEvidenceState {
                 process_instance,
-                detection_content_baseline: detection_content_seq,
+                pty_output_baseline: pty_output_seq,
                 freshness: if trusted_evidence_present {
                     AgentActionEvidenceFreshness::AwaitingAbsence
                 } else {
@@ -240,7 +241,7 @@ impl AgentActionRegistry {
         &self,
         terminal_id: &str,
         process_instance: super::agents::AgentProcessInstance,
-        detection_content_seq: u64,
+        pty_output_seq: u64,
         trusted_evidence_present: bool,
     ) -> bool {
         let mut inner = self
@@ -256,17 +257,15 @@ impl AgentActionRegistry {
 
         match state.freshness {
             AgentActionEvidenceFreshness::AwaitingAbsence => {
-                if !trusted_evidence_present
-                    && state.detection_content_baseline != detection_content_seq
-                {
+                if !trusted_evidence_present && state.pty_output_baseline != pty_output_seq {
                     state.freshness = AgentActionEvidenceFreshness::AwaitingReturn;
                 }
-                state.detection_content_baseline = detection_content_seq;
+                state.pty_output_baseline = pty_output_seq;
                 false
             }
             AgentActionEvidenceFreshness::AwaitingReturn => {
-                let evidence_advanced = state.detection_content_baseline != detection_content_seq;
-                state.detection_content_baseline = detection_content_seq;
+                let evidence_advanced = state.pty_output_baseline != pty_output_seq;
+                state.pty_output_baseline = pty_output_seq;
                 if trusted_evidence_present && evidence_advanced {
                     state.freshness = AgentActionEvidenceFreshness::Ready;
                     true
@@ -275,7 +274,7 @@ impl AgentActionRegistry {
                 }
             }
             AgentActionEvidenceFreshness::Ready => {
-                state.detection_content_baseline = detection_content_seq;
+                state.pty_output_baseline = pty_output_seq;
                 trusted_evidence_present
             }
         }
@@ -569,7 +568,7 @@ impl App {
             self.agent_action_registry.record_process_boundary(
                 &pane.terminal_id,
                 process_instance,
-                boundary_snapshot.content_seq,
+                boundary_snapshot.pty_output_seq,
                 boundary_evidence.is_some(),
             );
             return None;
@@ -586,7 +585,7 @@ impl App {
         if !self.agent_action_registry.process_evidence_is_fresh(
             &pane.terminal_id,
             process_instance,
-            snapshot.content_seq,
+            snapshot.pty_output_seq,
             evidence.is_some(),
         ) {
             return None;
@@ -625,18 +624,21 @@ fn capture_detection_snapshot(
     runtime: &crate::terminal::TerminalRuntime,
 ) -> Option<DetectionSnapshot> {
     for _ in 0..SNAPSHOT_ATTEMPTS {
-        let before = runtime.detection_content_seq();
+        let content_before = runtime.detection_content_seq();
+        let output_before = runtime.pty_output_seq();
         let screen = runtime.detection_text();
         let osc_title = runtime.agent_osc_title();
         let osc_progress = runtime.agent_osc_progress();
-        let after = runtime.detection_content_seq();
-        if before == after {
+        let output_after = runtime.pty_output_seq();
+        let content_after = runtime.detection_content_seq();
+        if content_before == content_after && output_before == output_after {
             let fingerprint = snapshot_fingerprint(&screen, &osc_title, &osc_progress);
             return Some(DetectionSnapshot {
                 screen,
                 osc_title,
                 osc_progress,
-                content_seq: after,
+                content_seq: content_after,
+                pty_output_seq: output_after,
                 fingerprint,
             });
         }
@@ -698,7 +700,7 @@ fn stale_capability_error() -> ErrorBody {
 
 #[cfg(test)]
 mod tests {
-    use super::{guarded_action_bytes, AgentActionKind};
+    use super::{guarded_action_bytes, AgentActionKind, AgentActionRegistry};
 
     #[test]
     fn guarded_action_bytes_are_single_byte_and_terminal_protocol_independent() {
@@ -710,5 +712,27 @@ mod tests {
             guarded_action_bytes(AgentActionKind::Interrupt),
             bytes::Bytes::from_static(b"\x1b")
         );
+    }
+
+    #[test]
+    fn resize_only_screen_changes_cannot_advance_process_evidence_freshness() {
+        let registry = AgentActionRegistry::new();
+        let process = super::super::agents::AgentProcessInstance {
+            pid: 7,
+            start_identity: 11,
+            process_group_id: Some(7),
+        };
+        registry.record_process_boundary("terminal", process, 20, true);
+
+        // Resize/reflow can hide and restore matched cells, but it does not
+        // advance the PTY-output generation.
+        assert!(!registry.process_evidence_is_fresh("terminal", process, 20, false));
+        assert!(!registry.process_evidence_is_fresh("terminal", process, 20, true));
+
+        // Real PTY output may establish absence. A resize-only return still
+        // cannot make the inherited evidence fresh.
+        assert!(!registry.process_evidence_is_fresh("terminal", process, 21, false));
+        assert!(!registry.process_evidence_is_fresh("terminal", process, 21, true));
+        assert!(registry.process_evidence_is_fresh("terminal", process, 22, true));
     }
 }

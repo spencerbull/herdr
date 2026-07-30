@@ -620,12 +620,33 @@ impl PtyIoActorRunner {
             }
         }
 
+        self.finish_actor_exit();
+        debug!(pane = self.pane_id, "PTY actor exiting");
+    }
+
+    fn finish_actor_exit(&mut self) {
+        {
+            let mut gate = self
+                .user_writes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            gate.accepting = false;
+            self.data_rx.close();
+        }
         self.fail_pending_writes(GuardedWriteError::Closed);
+        while let Ok(command) = self.data_rx.try_recv() {
+            match command {
+                PtyIoDataCommand::WriteUserInput(_) => self.finish_user_write(),
+                PtyIoDataCommand::GuardedWrite { reply, .. } => {
+                    self.finish_guarded_write();
+                    let _ = reply.send(Err(GuardedWriteError::Closed));
+                }
+            }
+        }
         self.close_user_write_gate();
         if let Some(on_reader_exit) = self.on_reader_exit.take() {
             on_reader_exit();
         }
-        debug!(pane = self.pane_id, "PTY actor exiting");
     }
 
     fn drain_commands(&mut self) -> bool {
@@ -1544,6 +1565,110 @@ mod tests {
             std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
         ));
         handle.shutdown();
+    }
+
+    #[test]
+    fn actor_exit_acks_queued_guard_before_blocking_reader_exit_callback() {
+        let (actor_socket, _peer) = UnixStream::pair().expect("socket pair");
+        actor_socket
+            .set_nonblocking(true)
+            .expect("actor socket nonblocking");
+        let (data_tx, data_rx) = mpsc::channel(ACTOR_COMMAND_BUFFER);
+        let outstanding_permit = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime")
+            .block_on(data_tx.clone().reserve_owned())
+            .expect("reserve data-queue capacity");
+        let (control_tx, control_rx) = std_mpsc::channel();
+        let wake_pipe = fd::create_wake_pipe().expect("wake pipe");
+        let user_writes = test_user_write_gate();
+        let controls = Arc::new(Mutex::new(SharedPtyControls::default()));
+        let response_order = Arc::new(Mutex::new(()));
+        let handle = PtyIoActorHandle {
+            data_tx,
+            control_tx,
+            wake: wake_pipe.writer,
+            user_writes: Arc::clone(&user_writes),
+            controls: Arc::clone(&controls),
+            response_order: Arc::clone(&response_order),
+        };
+        let (exit_started_tx, exit_started_rx) = std_mpsc::channel();
+        let (exit_release_tx, exit_release_rx) = std_mpsc::channel();
+        let mut runner = PtyIoActorRunner {
+            pane_id: 1,
+            file: std::fs::File::from(unsafe { OwnedFd::from_raw_fd(actor_socket.into_raw_fd()) }),
+            data_rx,
+            control_rx,
+            state: ActorState::Running,
+            pending_writes: VecDeque::new(),
+            current_write_offset: 0,
+            wake_read_fd: wake_pipe.read_fd,
+            controls,
+            response_order,
+            user_writes: Arc::clone(&user_writes),
+            on_read: Box::new(|_| PtyReadResult::empty()),
+            on_reader_exit: Some(Box::new(move || {
+                exit_started_tx
+                    .send(())
+                    .expect("exit callback observer alive");
+                exit_release_rx
+                    .recv()
+                    .expect("exit callback release arrives");
+            })),
+            poll_observer: None,
+        };
+        let (guarded_result_tx, guarded_result_rx) = std_mpsc::channel();
+        let guarded = std::thread::spawn(move || {
+            let result = handle.write_guarded(Bytes::from_static(b"\x1b"), Arc::new(|| true));
+            guarded_result_tx
+                .send(result)
+                .expect("guarded result observer alive");
+        });
+
+        let queued_deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if user_writes
+                .lock()
+                .expect("user write gate")
+                .guarded_write_pending
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < queued_deadline,
+                "guarded command should enter the data queue"
+            );
+            std::thread::yield_now();
+        }
+        std::thread::sleep(GUARDED_WRITE_TIMEOUT + Duration::from_millis(100));
+        assert!(
+            guarded_result_rx.try_recv().is_err(),
+            "timed-out caller must wait for the actor's definitive acknowledgment"
+        );
+
+        let actor_exit = std::thread::spawn(move || runner.finish_actor_exit());
+        exit_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("reader-exit callback starts");
+        assert_eq!(
+            guarded_result_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("queued guarded write is acknowledged before callback returns"),
+            Err(GuardedWriteError::Closed)
+        );
+        {
+            let gate = user_writes.lock().expect("user write gate");
+            assert!(!gate.accepting);
+            assert_eq!(gate.queued_user_writes, 0);
+            assert!(!gate.guarded_write_pending);
+        }
+
+        exit_release_tx
+            .send(())
+            .expect("release reader-exit callback");
+        actor_exit.join().expect("actor exit joins");
+        guarded.join().expect("guarded caller joins");
+        drop(outstanding_permit);
     }
 
     #[test]
