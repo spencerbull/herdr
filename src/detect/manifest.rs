@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock, RwLock},
 };
@@ -118,6 +119,14 @@ pub struct RuleEvidence {
     pub not_count: usize,
     pub region_bytes: usize,
     pub region_preview: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TrustedInterruptEvidence {
+    pub(crate) manifest_version: String,
+    pub(crate) rule_id: String,
+    pub(crate) priority: i32,
+    pub(crate) region: String,
 }
 
 #[derive(Debug, Clone)]
@@ -386,6 +395,69 @@ pub fn explain_with_input(agent: Agent, input: DetectionInput<'_>) -> DetectionE
         return fallback_explain(Some(agent), None, true);
     };
     evaluate_loaded_manifest(agent, input, loaded, true)
+}
+
+pub(crate) fn trusted_interrupt_evidence(
+    agent: Agent,
+    input: DetectionInput<'_>,
+) -> Option<TrustedInterruptEvidence> {
+    if agent != Agent::Codex {
+        return None;
+    }
+    let loaded = load_manifest(agent)?;
+    if loaded.source != ManifestSource::Bundled {
+        return None;
+    }
+
+    let explain = evaluate_loaded_manifest(agent, input, loaded.clone(), false);
+    if explain.screen_detection_skipped
+        || explain.skip_state_update
+        || explain.state != AgentState::Working
+        || !explain.visible_working
+    {
+        return None;
+    }
+
+    let mut trusted = loaded
+        .manifest
+        .rules
+        .iter()
+        .zip(&loaded.compiled_rules)
+        .filter(|(rule, _)| exact_codex_interrupt_rule(rule));
+    let (rule, compiled_rule) = trusted.next()?;
+    if trusted.next().is_some() {
+        return None;
+    }
+    let region_text = region(input, &rule.region);
+    if !compiled_rule_matches(compiled_rule, region_text) {
+        return None;
+    }
+
+    let contradictory_rule_matched = loaded
+        .manifest
+        .rules
+        .iter()
+        .zip(&loaded.compiled_rules)
+        .filter(|(candidate, _)| candidate.priority >= rule.priority)
+        .filter(|(candidate, _)| candidate.id != rule.id)
+        .any(|(candidate, compiled)| {
+            let candidate_region = region(input, &candidate.region);
+            compiled_rule_matches(compiled, candidate_region)
+                && (candidate.skip_state_update
+                    || candidate.visible_idle
+                    || candidate.visible_blocker
+                    || candidate.state.map(AgentState::from) != Some(AgentState::Working))
+        });
+    if contradictory_rule_matched {
+        return None;
+    }
+
+    Some(TrustedInterruptEvidence {
+        manifest_version: loaded.manifest.version.as_ref()?.to_string(),
+        rule_id: rule.id.clone(),
+        priority: rule.priority,
+        region: rule.region.clone(),
+    })
 }
 
 pub fn explain_for_label(agent_label: &str, screen_content: &str) -> DetectionExplain {
@@ -934,9 +1006,13 @@ fn validate_manifest(manifest: &AgentManifest) -> Result<(), String> {
     }
 
     let mut complexity = ManifestComplexity::default();
+    let mut rule_ids = HashSet::new();
     for rule in &manifest.rules {
         if rule.id.trim().is_empty() {
             return Err("manifest rule id must not be empty".to_string());
+        }
+        if !rule_ids.insert(rule.id.as_str()) {
+            return Err(format!("manifest rule id {} is duplicated", rule.id));
         }
         if rule.skip_state_update {
             if rule.state != Some(ManifestState::Unknown) {
@@ -969,6 +1045,35 @@ fn validate_manifest(manifest: &AgentManifest) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn exact_codex_interrupt_rule(rule: &ManifestRule) -> bool {
+    const INTERRUPT_LINE_REGEX: &str = r"^[•◦]\s+Working \([^)]*esc to interrupt\)(?: · .*)?$";
+
+    rule.id == "screen_working_fallback"
+        && rule.state == Some(ManifestState::Working)
+        && rule.priority == 500
+        && rule.region == "bottom_non_empty_lines(3)"
+        && !rule.visible_idle
+        && !rule.visible_blocker
+        && rule.visible_working
+        && !rule.skip_state_update
+        && rule.all.is_empty()
+        && rule.any.is_empty()
+        && rule.contains.is_empty()
+        && rule.regex.is_empty()
+        && rule.line_regex == [INTERRUPT_LINE_REGEX]
+        && rule.not_gate.len() == 1
+        && exact_contains_gate(&rule.not_gate[0], "■ Conversation interrupted")
+}
+
+fn exact_contains_gate(gate: &ManifestGate, expected: &str) -> bool {
+    gate.all.is_empty()
+        && gate.any.is_empty()
+        && gate.not_gate.is_empty()
+        && gate.contains == [expected]
+        && gate.regex.is_empty()
+        && gate.line_regex.is_empty()
 }
 
 #[derive(Default)]

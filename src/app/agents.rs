@@ -431,6 +431,50 @@ pub(super) fn runtime_hosts_agent(
     live_runtime_agent(runtime) == Some(expected)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct AgentProcessInstance {
+    pub(super) pid: u32,
+    pub(super) start_identity: u128,
+    pub(super) process_group_id: Option<u32>,
+}
+
+pub(super) fn runtime_agent_process_instance(
+    runtime: &crate::terminal::TerminalRuntime,
+    expected: crate::detect::Agent,
+) -> Option<AgentProcessInstance> {
+    #[cfg(test)]
+    if runtime.child_pid().is_none() {
+        return Some(AgentProcessInstance {
+            pid: 1,
+            start_identity: u128::from(runtime.test_agent_process_start_identity()),
+            process_group_id: Some(1),
+        });
+    }
+
+    let job = crate::detect::foreground_job(runtime.child_pid()?)?;
+    let (agent, pid) = crate::detect::identify_agent_process_in_job(&job)
+        .map(|(agent, _, pid)| (agent, pid))
+        .or_else(|| {
+            job.processes.iter().find_map(|process| {
+                crate::platform::process_agent_hint(process.pid).map(|agent| (agent, process.pid))
+            })
+        })?;
+    if agent != expected {
+        return None;
+    }
+
+    #[cfg(unix)]
+    let process_group_id = Some(job.process_group_id);
+    #[cfg(not(unix))]
+    let process_group_id = None;
+
+    Some(AgentProcessInstance {
+        pid,
+        start_identity: crate::platform::process_start_identity(pid)?,
+        process_group_id,
+    })
+}
+
 fn live_runtime_agent(runtime: &crate::terminal::TerminalRuntime) -> Option<crate::detect::Agent> {
     let job = crate::detect::foreground_job(runtime.child_pid()?)?;
     crate::detect::identify_agent_in_job(&job)

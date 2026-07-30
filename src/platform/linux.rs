@@ -355,6 +355,19 @@ fn process_pgrp_and_comm(pid: u32) -> Option<(i32, String)> {
     process_pgrp_and_comm_from_stat(&stat)
 }
 
+pub fn process_start_identity(pid: u32) -> Option<u128> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    process_start_identity_from_stat(&stat).map(u128::from)
+}
+
+fn process_start_identity_from_stat(stat: &str) -> Option<u64> {
+    let close = stat.rfind(')')?;
+    let rest = stat.get(close + 2..)?;
+    // After (comm): state is field 3 and starttime is field 22, so starttime
+    // is index 19 in this slice.
+    rest.split_whitespace().nth(19)?.parse().ok()
+}
+
 fn process_pgrp_and_comm_from_stat(stat: &str) -> Option<(i32, String)> {
     let close = stat.rfind(')')?;
     let comm = stat.get(1 + stat.find('(')?..close)?.to_string();
@@ -1054,6 +1067,12 @@ mod tests {
             process_pgrp_and_comm_from_stat("123 (name with ) paren) S 1 456 789 0 456"),
             Some((456, "name with ) paren".to_string()))
         );
+    }
+
+    #[test]
+    fn proc_stat_start_identity_handles_spaces_and_parens_in_comm() {
+        let stat = "123 (name with ) paren) S 1 456 789 0 456 0 0 0 0 0 0 0 0 0 0 0 0 0 98765";
+        assert_eq!(process_start_identity_from_stat(stat), Some(98_765));
     }
 
     #[test]

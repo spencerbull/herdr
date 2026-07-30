@@ -328,6 +328,11 @@ pub fn foreground_group_leader_job(process_group_id: u32) -> Option<ForegroundJo
     })
 }
 
+pub fn process_start_identity(pid: u32) -> Option<u128> {
+    let info = process_bsdinfo(pid)?;
+    Some((u128::from(info.pbi_start_tvsec) << 64) | u128::from(info.pbi_start_tvusec))
+}
+
 fn process_group_pids(process_group_id: u32) -> Vec<u32> {
     let mut capacity = 16usize;
 

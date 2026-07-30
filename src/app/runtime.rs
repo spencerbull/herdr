@@ -31,6 +31,8 @@ impl App {
     }
 
     pub(crate) fn shutdown_terminal_runtime(&mut self, terminal_id: crate::terminal::TerminalId) {
+        self.agent_action_registry
+            .remove_terminal(&terminal_id.to_string());
         let target = super::TerminalInputTarget {
             terminal_id: terminal_id.clone(),
         };

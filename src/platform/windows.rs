@@ -1026,6 +1026,11 @@ fn select_pane_foreground_job_cached(shell_pid: u32) -> Option<ForegroundJob> {
     select_pane_foreground_job_from_snapshot(shell_pid, &snapshot).map(|(job, _)| job)
 }
 
+pub fn process_start_identity(pid: u32) -> Option<u128> {
+    let process = ProcessHandle::open(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
+    process_creation_time(process.0).map(u128::from)
+}
+
 fn select_pane_foreground_job_from_snapshot(
     shell_pid: u32,
     snapshot: &ProcessSnapshot,

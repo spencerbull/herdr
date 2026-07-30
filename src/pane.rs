@@ -1134,6 +1134,8 @@ pub struct PaneRuntime {
     detect_reset_notify: Arc<Notify>,
     pending_release: Arc<Mutex<Option<PendingAgentRelease>>>,
     preserve_processes_on_drop: bool,
+    #[cfg(test)]
+    test_agent_process_start_identity: AtomicU64,
     // Task handles for deterministic shutdown
     detect_handle: Option<tokio::task::AbortHandle>,
 }
@@ -2095,6 +2097,8 @@ impl PaneRuntime {
             detect_reset_notify,
             pending_release,
             preserve_processes_on_drop: true,
+            #[cfg(test)]
+            test_agent_process_start_identity: AtomicU64::new(1),
             detect_handle: Some(detect_handle),
         })
     }
@@ -2664,6 +2668,8 @@ impl PaneRuntime {
             detect_reset_notify,
             pending_release,
             preserve_processes_on_drop: false,
+            #[cfg(test)]
+            test_agent_process_start_identity: AtomicU64::new(1),
             detect_handle,
         })
     }
@@ -3078,6 +3084,18 @@ impl PaneRuntime {
         (pid > 0).then_some(pid)
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_agent_process_start_identity(&self) -> u64 {
+        self.test_agent_process_start_identity
+            .load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_replace_agent_process_instance(&self) {
+        self.test_agent_process_start_identity
+            .fetch_add(1, Ordering::AcqRel);
+    }
+
     pub fn follow_cwd(&self) -> Option<std::path::PathBuf> {
         #[cfg(unix)]
         {
@@ -3190,6 +3208,7 @@ impl PaneRuntime {
                 detect_reset_notify: Arc::new(Notify::new()),
                 pending_release: Arc::new(Mutex::new(None)),
                 preserve_processes_on_drop: true,
+                test_agent_process_start_identity: AtomicU64::new(1),
                 detect_handle: Some(tokio::spawn(async {}).abort_handle()),
             },
             rx,
@@ -3834,6 +3853,7 @@ mod tests {
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
             preserve_processes_on_drop: true,
+            test_agent_process_start_identity: AtomicU64::new(1),
             detect_handle: Some(tokio::spawn(async {}).abort_handle()),
         };
 
@@ -3866,6 +3886,7 @@ mod tests {
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
             preserve_processes_on_drop: true,
+            test_agent_process_start_identity: AtomicU64::new(1),
             detect_handle: Some(tokio::spawn(async {}).abort_handle()),
         };
 

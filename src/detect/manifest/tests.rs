@@ -39,6 +39,30 @@ id = "codex"
     )
 }
 
+fn codex_interrupt_rule_manifest(version: Option<&str>) -> String {
+    let version = version
+        .map(|version| {
+            format!(
+                "version = \"{version}\"\nmin_engine_version = 3\nupdated_at = \"2026-07-30T00:00:00Z\"\n"
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        r#"
+id = "codex"
+{version}
+[[rules]]
+id = "screen_working_fallback"
+state = "working"
+priority = 500
+region = "bottom_non_empty_lines(3)"
+visible_working = true
+line_regex = ['^[•◦]\s+Working \([^)]*esc to interrupt\)(?: · .*)?$']
+not = [{{ contains = ["■ Conversation interrupted"] }}]
+"#
+    )
+}
+
 fn with_manifest_dirs<T>(name: &str, f: impl FnOnce() -> T) -> T {
     let _guard = crate::config::test_config_env_lock().lock().unwrap();
     let old_config = std::env::var_os("XDG_CONFIG_HOME");
@@ -298,6 +322,27 @@ fn all_bundled_manifests_parse_and_validate() {
             agent_label(agent)
         );
     }
+}
+
+#[test]
+fn duplicate_manifest_rule_ids_are_rejected() {
+    let manifest = rules_manifest(
+        r#"
+[[rules]]
+id = "duplicate"
+state = "working"
+contains = ["first"]
+
+[[rules]]
+id = "duplicate"
+state = "blocked"
+contains = ["second"]
+"#,
+    );
+
+    assert!(parse_manifest(&manifest)
+        .unwrap_err()
+        .contains("rule id duplicate is duplicated"));
 }
 
 #[test]
@@ -899,6 +944,78 @@ fn codex_osc_working_remains_preferred_over_screen_fallback() {
         Some("osc_title_working")
     );
     assert!(result.visible_working);
+}
+
+#[test]
+fn codex_interrupt_authority_rejects_spinner_masked_blockers_and_viewers() {
+    let spinner = "⠸ project";
+    let blocker = "• Working (4s • esc to interrupt)\n\
+        › 1. Yes, proceed\n\
+        Press enter to confirm or esc to cancel\n";
+    let viewer = "• Working (4s • esc to interrupt)\n\
+        › transcript\n\
+        ↑/↓ to scroll · pgup/pgdn to move · home/end to jump · q to quit · esc to edit prev\n";
+
+    for screen in [blocker, viewer] {
+        let explain = osc_explain(Agent::Codex, screen, spinner, "");
+        assert_eq!(explain.state, AgentState::Working);
+        assert_eq!(
+            explain.matched_rule.as_ref().map(|rule| rule.id.as_str()),
+            Some("osc_title_working")
+        );
+        assert!(trusted_interrupt_evidence(
+            Agent::Codex,
+            DetectionInput {
+                screen,
+                osc_title: spinner,
+                osc_progress: "",
+            }
+        )
+        .is_none());
+    }
+}
+
+#[test]
+fn codex_interrupt_authority_accepts_bundled_spinner_and_exact_footer() {
+    let screen = "• Working (4s • esc to interrupt)\n";
+    let evidence = trusted_interrupt_evidence(
+        Agent::Codex,
+        DetectionInput {
+            screen,
+            osc_title: "⠸ project",
+            osc_progress: "",
+        },
+    )
+    .expect("bundled exact footer should authorize interrupt");
+
+    assert_eq!(evidence.rule_id, "screen_working_fallback");
+    assert_eq!(evidence.priority, 500);
+}
+
+#[test]
+fn codex_interrupt_authority_rejects_remote_and_override_rule_ids() {
+    with_manifest_dirs("interrupt-authority-source", || {
+        let screen = "• Working (4s • esc to interrupt)\n";
+        let input = DetectionInput {
+            screen,
+            osc_title: "",
+            osc_progress: "",
+        };
+
+        write_remote_codex(&codex_interrupt_rule_manifest(Some("9999.07.30.1")));
+        assert!(matches!(
+            explain_with_input(Agent::Codex, input).source,
+            Some(ManifestSource::Remote { .. })
+        ));
+        assert!(trusted_interrupt_evidence(Agent::Codex, input).is_none());
+
+        write_local_codex(&codex_interrupt_rule_manifest(None));
+        assert!(matches!(
+            explain_with_input(Agent::Codex, input).source,
+            Some(ManifestSource::Override(_))
+        ));
+        assert!(trusted_interrupt_evidence(Agent::Codex, input).is_none());
+    });
 }
 
 #[test]

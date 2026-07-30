@@ -480,6 +480,26 @@ No, and tell Codex what to do differently\n"
     }
 
     #[tokio::test]
+    async fn same_kind_process_replacement_rejects_bound_interrupt() {
+        let (mut app, pane_id, mut rx) =
+            app_with_codex_action_screen(AgentState::Working, CODEX_INTERRUPT_SCREEN);
+        let capability = only_action(&app, pane_id, AgentActionKind::Interrupt);
+        app.lookup_runtime_sender(0, pane_id)
+            .unwrap()
+            .test_replace_agent_process_instance();
+
+        let response = app.handle_agent_perform_action(
+            "same-kind-replacement".into(),
+            AgentPerformActionParams {
+                capability_id: capability.capability_id,
+            },
+        );
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "agent_action_capability_stale");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn changed_screen_state_sequence_revision_and_pane_identity_reject_old_actions() {
         let (mut app, pane_id, mut rx) =
             app_with_codex_action_screen(AgentState::Working, CODEX_INTERRUPT_SCREEN);
@@ -555,7 +575,7 @@ No, and tell Codex what to do differently\n"
     }
 
     #[tokio::test]
-    async fn server_epoch_and_failed_send_invalidate_capabilities_without_retry() {
+    async fn unavailable_capabilities_and_failed_send_are_not_retried() {
         let (mut app, pane_id, mut rx) =
             app_with_codex_action_screen(AgentState::Working, CODEX_INTERRUPT_SCREEN);
         let capability = only_action(&app, pane_id, AgentActionKind::Interrupt);
@@ -568,7 +588,7 @@ No, and tell Codex what to do differently\n"
             },
         );
         let error: ErrorResponse = serde_json::from_str(&response).unwrap();
-        assert_eq!(error.error.code, "agent_action_capability_expired");
+        assert_eq!(error.error.code, "agent_action_capability_not_found");
         assert!(rx.try_recv().is_err());
 
         let (mut app, pane_id, mut rx) =
@@ -609,7 +629,57 @@ No, and tell Codex what to do differently\n"
     }
 
     #[tokio::test]
-    async fn agent_prompt_sends_text_then_delays_enter() {
+    async fn expired_capabilities_are_not_found_before_or_after_listing_cleanup() {
+        let (mut app, pane_id, mut rx) =
+            app_with_codex_action_screen(AgentState::Working, CODEX_INTERRUPT_SCREEN);
+        let capability = only_action(&app, pane_id, AgentActionKind::Interrupt);
+        app.agent_action_registry
+            .expire_for_test(&capability.capability_id);
+        assert_eq!(app.agent_action_registry.entry_counts_for_test(), (1, 1));
+        assert_eq!(app.agent_info(0, pane_id).unwrap().actions.len(), 1);
+        let response = app.handle_agent_perform_action(
+            "expired-after-list".into(),
+            AgentPerformActionParams {
+                capability_id: capability.capability_id,
+            },
+        );
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "agent_action_capability_not_found");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn consumed_tombstone_is_reclaimed_when_terminal_disappears() {
+        let (mut app, pane_id, mut rx) =
+            app_with_codex_action_screen(AgentState::Working, CODEX_INTERRUPT_SCREEN);
+        let terminal_id = app.state.workspaces[0]
+            .terminal_id(pane_id)
+            .unwrap()
+            .clone();
+        let capability = only_action(&app, pane_id, AgentActionKind::Interrupt);
+        let response = app.handle_agent_perform_action(
+            "consume-before-close".into(),
+            AgentPerformActionParams {
+                capability_id: capability.capability_id,
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(
+            success.result,
+            ResponseResult::AgentActionPerformed { .. }
+        ));
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"\x1b"));
+        assert_eq!(app.agent_action_registry.entry_counts_for_test(), (0, 1));
+
+        app.state.terminals.remove(&terminal_id);
+        app.state.terminal_runtime_shutdowns.push(terminal_id);
+        app.shutdown_detached_terminal_runtimes();
+
+        assert_eq!(app.agent_action_registry.entry_counts_for_test(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn agent_prompt_accepts_pane_ids_and_working_agents_atomically() {
         let mut app = app_with_agent();
         let pane_id = app.state.workspaces[0].tabs[0].root_pane;
         let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]

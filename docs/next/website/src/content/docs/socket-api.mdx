@@ -788,22 +788,26 @@ Perform the action by returning only its opaque capability ID:
 Capabilities are process-memory-only, expire after 30 seconds, and are consumed
 before revalidation and input. A consumed capability is never retried, including
 when input could not be queued. A server restart or live handoff invalidates all
-previous capabilities.
+previous capabilities. Unknown, expired, consumed, and previous-server IDs all
+return `agent_action_capability_not_found`.
 
 The server re-resolves and rechecks the terminal, current pane/workspace/tab
-identity, foreground agent process, semantic status, state-change sequence,
-revision, manifest evidence, detection-content sequence, and a fingerprint of
-the screen plus OSC evidence. It then sends exactly one server-selected key:
-Enter for `approve` or Escape for `interrupt`. The request cannot choose a
-target, action, or raw key payload.
+identity, exact foreground agent process instance (matched PID, process
+start/creation identity, and process group where the platform provides one),
+semantic status, state-change sequence, revision, trusted bundled-manifest
+evidence, detection-content sequence, and a fingerprint of the screen plus OSC
+evidence. It then sends exactly one server-selected key: Enter for `approve` or
+Escape for `interrupt`. The request cannot choose a target, action, or raw key
+payload.
 
 `approve` is reserved in the typed action enum, but Herdr intentionally does not
 issue approval capabilities yet. Current prompt families do not provide a
 verified, action-specific screen rule that proves Enter means one-time approval;
 generic confirmations, structured questions, selected permission policies, and
 weak `[y/n]` prompts are not sufficient. An `interrupt` capability requires the
-current on-screen `esc to interrupt` working footer; a spinner or lifecycle
-status alone does not qualify.
+exact trusted bundled rule for the current on-screen `esc to interrupt` working
+footer; local overrides, downloaded manifests, a spinner, or lifecycle status
+alone do not qualify.
 
 Revalidation is intentionally conservative and can reject an action after any
 redraw or state change. It closes the client/API time-of-check gap, but PTY

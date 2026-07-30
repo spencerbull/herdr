@@ -131,7 +131,6 @@
 - Added automatic text history reads for idle alternate-screen agents, with the application viewport restored after collection.
 - Added `workspace.move_block`, the `workspace.reordered` event, and atomic worktree-group reordering. (#1694)
 - Added a Simplified Chinese README. (#1990, thanks @patrick-xin)
-
 ### Changed
 - Experimental options are no longer exposed in the Settings TUI and remain available through the config file.
 - Agent status indicators now use the same static workspace marks across the sidebar, navigator, and mobile views, eliminating continuous spinner rendering while agents work.

@@ -1,9 +1,6 @@
 use std::{
     collections::HashMap,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Mutex,
-    },
+    sync::Mutex,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -15,10 +12,7 @@ use crate::{
         AgentActionCapability, AgentActionEvidence, AgentActionKind, AgentStatus, ErrorBody,
         PaneInfo,
     },
-    detect::{
-        manifest::{DetectionExplain, DetectionInput},
-        Agent, AgentState,
-    },
+    detect::{manifest::DetectionInput, Agent},
     terminal::TerminalState,
 };
 
@@ -26,7 +20,6 @@ use super::App;
 
 const ACTION_CAPABILITY_TTL: Duration = Duration::from_secs(30);
 const SNAPSHOT_ATTEMPTS: usize = 3;
-static NEXT_ACTION_EPOCH: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) struct AgentActionRegistry {
     epoch: [u8; 32],
@@ -35,7 +28,6 @@ pub(crate) struct AgentActionRegistry {
 
 #[derive(Default)]
 struct AgentActionRegistryInner {
-    next_id: u64,
     active: HashMap<String, StoredAgentActionCapability>,
     slots: HashMap<AgentActionSlot, AgentActionSlotState>,
 }
@@ -75,6 +67,7 @@ struct AgentActionBinding {
     revision: u64,
     detection_content_seq: u64,
     screen_fingerprint: [u8; 32],
+    process_instance: super::agents::AgentProcessInstance,
     evidence: AgentActionEvidenceBinding,
 }
 
@@ -93,25 +86,12 @@ struct DetectionSnapshot {
     fingerprint: [u8; 32],
 }
 
-enum CapabilityLookupError {
-    NotFound,
-    Expired,
-}
-
 impl AgentActionRegistry {
     pub(crate) fn new() -> Self {
-        let counter = NEXT_ACTION_EPOCH.fetch_add(1, Ordering::Relaxed);
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or_default();
-        let mut hasher = Sha256::new();
-        hash_field(&mut hasher, b"herdr-agent-action-epoch-v1");
-        hash_field(&mut hasher, &std::process::id().to_be_bytes());
-        hash_field(&mut hasher, &counter.to_be_bytes());
-        hash_field(&mut hasher, &nanos.to_be_bytes());
+        let mut epoch = [0_u8; 32];
+        fill_secret(&mut epoch);
         Self {
-            epoch: hasher.finalize().into(),
+            epoch,
             inner: Mutex::new(AgentActionRegistryInner::default()),
         }
     }
@@ -142,13 +122,19 @@ impl AgentActionRegistry {
             inner.slots.remove(&slot);
         }
 
-        inner.next_id = inner.next_id.wrapping_add(1);
-        let mut id_hasher = Sha256::new();
-        hash_field(&mut id_hasher, b"herdr-agent-action-capability-v1");
-        hash_field(&mut id_hasher, &self.epoch);
-        hash_field(&mut id_hasher, &inner.next_id.to_be_bytes());
-        hash_field(&mut id_hasher, &binding_digest);
-        let capability_id = format!("act_{:x}", id_hasher.finalize());
+        let capability_id = loop {
+            let mut nonce = [0_u8; 32];
+            fill_secret(&mut nonce);
+            let mut id_hasher = Sha256::new();
+            hash_field(&mut id_hasher, b"herdr-agent-action-capability-v1");
+            hash_field(&mut id_hasher, &self.epoch);
+            hash_field(&mut id_hasher, &nonce);
+            hash_field(&mut id_hasher, &binding_digest);
+            let candidate = format!("act_{:x}", id_hasher.finalize());
+            if !inner.active.contains_key(&candidate) {
+                break candidate;
+            }
+        };
         let expires_at_unix_ms = SystemTime::now()
             .checked_add(ACTION_CAPABILITY_TTL)
             .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
@@ -173,17 +159,12 @@ impl AgentActionRegistry {
         Some(public)
     }
 
-    fn take(
-        &self,
-        capability_id: &str,
-    ) -> Result<StoredAgentActionCapability, CapabilityLookupError> {
+    fn take(&self, capability_id: &str) -> Option<StoredAgentActionCapability> {
         let mut inner = self
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some(stored) = inner.active.remove(capability_id) else {
-            return Err(CapabilityLookupError::NotFound);
-        };
+        let stored = inner.active.remove(capability_id)?;
         let slot = AgentActionSlot {
             terminal_id: stored.binding.terminal_id.clone(),
             action: stored.binding.action,
@@ -195,9 +176,22 @@ impl AgentActionRegistry {
         }
         if Instant::now() >= stored.expires_at {
             inner.slots.remove(&slot);
-            return Err(CapabilityLookupError::Expired);
+            return None;
         }
-        Ok(stored)
+        Some(stored)
+    }
+
+    pub(crate) fn remove_terminal(&self, terminal_id: &str) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner
+            .active
+            .retain(|_, stored| stored.binding.terminal_id != terminal_id);
+        inner
+            .slots
+            .retain(|slot, _| slot.terminal_id != terminal_id);
     }
 
     #[cfg(test)]
@@ -209,6 +203,15 @@ impl AgentActionRegistry {
         if let Some(stored) = inner.active.get_mut(capability_id) {
             stored.expires_at = Instant::now() - Duration::from_millis(1);
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn entry_counts_for_test(&self) -> (usize, usize) {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (inner.active.len(), inner.slots.len())
     }
 }
 
@@ -260,6 +263,19 @@ impl AgentActionBinding {
         hash_field(&mut hasher, &self.revision.to_be_bytes());
         hash_field(&mut hasher, &self.detection_content_seq.to_be_bytes());
         hash_field(&mut hasher, &self.screen_fingerprint);
+        hash_field(&mut hasher, &self.process_instance.pid.to_be_bytes());
+        hash_field(
+            &mut hasher,
+            &self.process_instance.start_identity.to_be_bytes(),
+        );
+        hash_field(
+            &mut hasher,
+            &self
+                .process_instance
+                .process_group_id
+                .unwrap_or_default()
+                .to_be_bytes(),
+        );
         hash_field(&mut hasher, self.evidence.public.manifest_source.as_bytes());
         hash_field(
             &mut hasher,
@@ -310,16 +326,10 @@ impl App {
         let stored = self
             .agent_action_registry
             .take(capability_id)
-            .map_err(|err| match err {
-                CapabilityLookupError::NotFound => ErrorBody {
-                    code: "agent_action_capability_not_found".into(),
-                    message: "agent action capability is unknown, consumed, or from another server session"
-                        .into(),
-                },
-                CapabilityLookupError::Expired => ErrorBody {
-                    code: "agent_action_capability_expired".into(),
-                    message: "agent action capability expired before it was performed".into(),
-                },
+            .ok_or_else(|| ErrorBody {
+                code: "agent_action_capability_not_found".into(),
+                message: "agent action capability is unknown, expired, consumed, or from another server session"
+                    .into(),
             })?;
 
         let resolved = self
@@ -377,6 +387,11 @@ impl App {
         if runtime.detection_content_seq() != stored.binding.detection_content_seq {
             return Err(stale_capability_error());
         }
+        if super::agents::runtime_agent_process_instance(runtime, stored.binding.expected_agent)
+            != Some(stored.binding.process_instance)
+        {
+            return Err(stale_capability_error());
+        }
         runtime
             .try_send_bytes(Bytes::from(bytes))
             .map_err(|err| ErrorBody {
@@ -402,24 +417,22 @@ impl App {
         }
         let expected_agent = terminal.effective_known_agent()?;
         let runtime = self.lookup_runtime_sender(ws_idx, pane_id)?;
-        if !super::agents::runtime_hosts_agent(runtime, expected_agent) {
-            return None;
-        }
+        let process_instance =
+            super::agents::runtime_agent_process_instance(runtime, expected_agent)?;
         if pane.agent_status != AgentStatus::Working {
             return None;
         }
         let snapshot = capture_detection_snapshot(runtime)?;
-        let explain = crate::detect::manifest::explain_with_input(
+        let evidence = crate::detect::manifest::trusted_interrupt_evidence(
             expected_agent,
             DetectionInput {
                 screen: &snapshot.screen,
                 osc_title: &snapshot.osc_title,
                 osc_progress: &snapshot.osc_progress,
             },
-        );
+        )?;
         // Approval remains intentionally unavailable until a current agent UI
         // has an action-specific prompt rule verified from a live screen.
-        let evidence = interrupt_evidence(&explain, expected_agent)?;
         Some(AgentActionBinding {
             action: AgentActionKind::Interrupt,
             terminal_id: pane.terminal_id.clone(),
@@ -433,44 +446,18 @@ impl App {
             revision: pane.revision,
             detection_content_seq: snapshot.content_seq,
             screen_fingerprint: snapshot.fingerprint,
-            evidence,
+            process_instance,
+            evidence: AgentActionEvidenceBinding {
+                public: AgentActionEvidence {
+                    manifest_source: "bundled".into(),
+                    manifest_version: evidence.manifest_version,
+                    rule_id: evidence.rule_id,
+                },
+                priority: evidence.priority,
+                region: evidence.region,
+            },
         })
     }
-}
-
-fn interrupt_evidence(
-    explain: &DetectionExplain,
-    agent: Agent,
-) -> Option<AgentActionEvidenceBinding> {
-    if explain.screen_detection_skipped
-        || explain.skip_state_update
-        || explain.matched_rule.is_none()
-        || agent != Agent::Codex
-        || explain.state != AgentState::Working
-        || !explain.visible_working
-    {
-        return None;
-    }
-    let source = explain.source.as_ref()?.label();
-    let version = explain.manifest_version.clone()?;
-    let rule = explain
-        .evaluated_rules
-        .iter()
-        .filter(|rule| {
-            rule.matched
-                && rule.state == AgentState::Working
-                && rule.id == "screen_working_fallback"
-        })
-        .max_by_key(|rule| rule.priority)?;
-    Some(AgentActionEvidenceBinding {
-        public: AgentActionEvidence {
-            manifest_source: source,
-            manifest_version: version,
-            rule_id: rule.id.clone(),
-        },
-        priority: rule.priority,
-        region: rule.region.clone(),
-    })
 }
 
 fn capture_detection_snapshot(
@@ -508,6 +495,12 @@ fn snapshot_fingerprint(screen: &str, osc_title: &str, osc_progress: &str) -> [u
 fn hash_field(hasher: &mut Sha256, value: &[u8]) {
     hasher.update((value.len() as u64).to_be_bytes());
     hasher.update(value);
+}
+
+fn fill_secret(bytes: &mut [u8]) {
+    if let Err(err) = getrandom::fill(bytes) {
+        panic!("operating system random source unavailable for agent action capability: {err}");
+    }
 }
 
 fn action_label(action: AgentActionKind) -> &'static str {

@@ -567,6 +567,16 @@ impl TerminalRuntime {
         self.0.child_pid()
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_agent_process_start_identity(&self) -> u64 {
+        self.0.test_agent_process_start_identity()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_replace_agent_process_instance(&self) {
+        self.0.test_replace_agent_process_instance();
+    }
+
     pub(crate) fn current_size(&self) -> (u16, u16) {
         self.0.current_size()
     }
