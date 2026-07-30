@@ -1222,6 +1222,18 @@
     },
     "request": {
       "$defs": {
+        "AgentPerformActionParams": {
+          "additionalProperties": false,
+          "properties": {
+            "capability_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "capability_id"
+          ],
+          "type": "object"
+        },
         "AgentPromptParams": {
           "properties": {
             "target": {
@@ -5016,6 +5028,22 @@
         {
           "properties": {
             "method": {
+              "const": "agent.perform_action",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentPerformActionParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "agent.rename",
               "type": "string"
             },
@@ -6136,8 +6164,101 @@
     },
     "success_response": {
       "$defs": {
+        "AgentActionCapability": {
+          "properties": {
+            "action": {
+              "$ref": "#/schemas/success_response/$defs/AgentActionKind"
+            },
+            "agent": {
+              "type": "string"
+            },
+            "agent_status": {
+              "$ref": "#/schemas/success_response/$defs/AgentStatus"
+            },
+            "capability_id": {
+              "type": "string"
+            },
+            "evidence": {
+              "$ref": "#/schemas/success_response/$defs/AgentActionEvidence"
+            },
+            "expires_at_unix_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "revision": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "state_change_seq": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "tab_id": {
+              "type": "string"
+            },
+            "terminal_id": {
+              "type": "string"
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "capability_id",
+            "action",
+            "terminal_id",
+            "workspace_id",
+            "tab_id",
+            "pane_id",
+            "agent",
+            "agent_status",
+            "state_change_seq",
+            "revision",
+            "expires_at_unix_ms",
+            "evidence"
+          ],
+          "type": "object"
+        },
+        "AgentActionEvidence": {
+          "properties": {
+            "manifest_source": {
+              "type": "string"
+            },
+            "manifest_version": {
+              "type": "string"
+            },
+            "rule_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "manifest_source",
+            "manifest_version",
+            "rule_id"
+          ],
+          "type": "object"
+        },
+        "AgentActionKind": {
+          "enum": [
+            "approve",
+            "interrupt"
+          ],
+          "type": "string"
+        },
         "AgentInfo": {
           "properties": {
+            "actions": {
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/AgentActionCapability"
+              },
+              "type": "array"
+            },
             "agent": {
               "type": [
                 "string",
@@ -8971,6 +9092,30 @@
               "required": [
                 "type",
                 "agent"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "action": {
+                  "$ref": "#/schemas/success_response/$defs/AgentActionKind"
+                },
+                "pane_id": {
+                  "type": "string"
+                },
+                "terminal_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "agent_action_performed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "action",
+                "terminal_id",
+                "pane_id"
               ],
               "type": "object"
             },

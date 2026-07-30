@@ -23,6 +23,42 @@ pub struct AgentSendKeysParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentPerformActionParams {
+    pub capability_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentActionKind {
+    Approve,
+    Interrupt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentActionEvidence {
+    pub manifest_source: String,
+    pub manifest_version: String,
+    pub rule_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentActionCapability {
+    pub capability_id: String,
+    pub action: AgentActionKind,
+    pub terminal_id: String,
+    pub workspace_id: String,
+    pub tab_id: String,
+    pub pane_id: String,
+    pub agent: String,
+    pub agent_status: AgentStatus,
+    pub state_change_seq: u64,
+    pub revision: u64,
+    pub expires_at_unix_ms: u64,
+    pub evidence: AgentActionEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AgentWaitParams {
     pub target: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -215,6 +251,8 @@ pub struct AgentInfo {
     pub interactive_ready: bool,
     #[serde(default)]
     pub state_change_seq: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<AgentActionCapability>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

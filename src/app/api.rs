@@ -1080,6 +1080,9 @@ impl App {
             Method::AgentSendKeys(params) => {
                 return self.handle_agent_send_keys(request.id, params)
             }
+            Method::AgentPerformAction(params) => {
+                return self.handle_agent_perform_action(request.id, params)
+            }
             Method::PaneSplit(params) => return self.handle_pane_split(request.id, params),
             Method::PaneSwap(params) => return self.handle_pane_swap(request.id, params),
             Method::PaneMove(params) => return self.handle_pane_move(request.id, params),

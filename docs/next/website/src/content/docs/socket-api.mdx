@@ -40,7 +40,7 @@ The socket API can:
 - create, list, focus, rename, and close workspaces
 - create, list, focus, rename, and close tabs
 - list, inspect, split, swap, focus, resize, rename, read, close, and send input to panes
-- list, inspect, read, prompt, wait on, rename, focus, start, and attach agents through CLI helpers
+- list, inspect, read, prompt, wait on, rename, focus, start, attach, and perform guarded agent actions
 - report custom agent state from hooks and plugins
 - subscribe to events and wait for output or state changes
 - install and uninstall built-in integrations
@@ -106,7 +106,7 @@ Raw socket method names use dot notation:
 | Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.read`, `pane.graphics.info`, `pane.graphics.set`, `pane.graphics.clear`, `pane.graphics.stream`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
 | Popup | `popup.close` |
 | Layout | `layout.export`, `layout.apply`, `layout.set_split_ratio` |
-| Agent | `agent.list`, `agent.get`, `agent.read`, `agent.explain`, `agent.send_keys`, `agent.prompt`, `agent.wait`, `agent.rename`, `agent.focus`, `agent.start`, `agent.view.set`, `agent.view.clear` |
+| Agent | `agent.list`, `agent.get`, `agent.read`, `agent.explain`, `agent.send_keys`, `agent.perform_action`, `agent.prompt`, `agent.wait`, `agent.rename`, `agent.focus`, `agent.start`, `agent.view.set`, `agent.view.clear` |
 | Events | `events.subscribe`, `events.wait` |
 | Integrations | `integration.install`, `integration.uninstall` |
 | Plugins | `plugin.link`, `plugin.list`, `plugin.unlink`, `plugin.enable`, `plugin.disable`, `plugin.action.list`, `plugin.action.invoke`, `plugin.log.list`, `plugin.pane.open`, `plugin.pane.focus`, `plugin.pane.close` |
@@ -745,6 +745,71 @@ If no native session reference is stored, the field is omitted.
 `pane.get`, `pane.list`, `agent.get`, and `agent.list` also expose `foreground_cwd` when Herdr can resolve the cwd of the process currently controlling the pane PTY. The existing `cwd` field remains the pane/workspace cwd used for labels, follow-cwd behavior, and restored session state.
 
 `PaneInfo` and `AgentInfo` expose optional `terminal_title` and `terminal_title_stripped` fields. `terminal_title` is the latest OSC 0/2 title after safety normalization. `terminal_title_stripped` removes one recognized leading activity or spinner glyph and following whitespace. These server-owned values are ephemeral across a cold restart and are independent of the metadata `title` and semantic agent state.
+
+## Guarded agent actions
+
+`agent.get`, `agent.list`, and `session.snapshot` can expose an `actions` array
+on an agent record. Each entry is a short-lived capability for one server-owned
+action:
+
+```json
+{
+  "actions": [{
+    "capability_id": "act_...",
+    "action": "interrupt",
+    "terminal_id": "term_...",
+    "workspace_id": "w1",
+    "tab_id": "w1:t1",
+    "pane_id": "w1:p1",
+    "agent": "codex",
+    "agent_status": "working",
+    "state_change_seq": 42,
+    "revision": 3,
+    "expires_at_unix_ms": 1785384000000,
+    "evidence": {
+      "manifest_source": "bundled",
+      "manifest_version": "2026.07.18.1",
+      "rule_id": "screen_working_fallback"
+    }
+  }]
+}
+```
+
+Perform the action by returning only its opaque capability ID:
+
+```json
+{
+  "id": "req_action",
+  "method": "agent.perform_action",
+  "params": { "capability_id": "act_..." }
+}
+```
+
+Capabilities are process-memory-only, expire after 30 seconds, and are consumed
+before revalidation and input. A consumed capability is never retried, including
+when input could not be queued. A server restart or live handoff invalidates all
+previous capabilities.
+
+The server re-resolves and rechecks the terminal, current pane/workspace/tab
+identity, foreground agent process, semantic status, state-change sequence,
+revision, manifest evidence, detection-content sequence, and a fingerprint of
+the screen plus OSC evidence. It then sends exactly one server-selected key:
+Enter for `approve` or Escape for `interrupt`. The request cannot choose a
+target, action, or raw key payload.
+
+`approve` is reserved in the typed action enum, but Herdr intentionally does not
+issue approval capabilities yet. Current prompt families do not provide a
+verified, action-specific screen rule that proves Enter means one-time approval;
+generic confirmations, structured questions, selected permission policies, and
+weak `[y/n]` prompts are not sufficient. An `interrupt` capability requires the
+current on-screen `esc to interrupt` working footer; a spinner or lifecycle
+status alone does not qualify.
+
+Revalidation is intentionally conservative and can reject an action after any
+redraw or state change. It closes the client/API time-of-check gap, but PTY
+output can still race the final queue write; clients should describe the action
+as perform-time revalidated, not transactionally atomic. Refresh agent state and
+wait for a newly issued capability instead of retrying a rejected or failed ID.
 
 Use `pane.report_metadata` when a user hook wants to customize presentation without taking over lifecycle state from a Herdr integration.
 

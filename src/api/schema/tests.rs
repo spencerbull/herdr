@@ -273,6 +273,49 @@ fn request_round_trips_for_agent_explain() {
 }
 
 #[test]
+fn request_round_trips_for_agent_perform_action() {
+    let request = Request {
+        id: "req_agent_action".into(),
+        method: Method::AgentPerformAction(AgentPerformActionParams {
+            capability_id: "act_123".into(),
+        }),
+    };
+
+    let json = serde_json::to_value(&request).unwrap();
+    assert_eq!(json["method"], "agent.perform_action");
+    assert_eq!(json["params"]["capability_id"], "act_123");
+    let restored: Request = serde_json::from_value(json).unwrap();
+    assert_eq!(restored, request);
+
+    let with_raw_payload = serde_json::json!({
+        "id": "req_agent_action",
+        "method": "agent.perform_action",
+        "params": {
+            "capability_id": "act_123",
+            "action": "approve",
+            "keys": ["enter"]
+        }
+    });
+    assert!(serde_json::from_value::<Request>(with_raw_payload).is_err());
+}
+
+#[test]
+fn agent_info_actions_default_for_older_records() {
+    let agent: AgentInfo = serde_json::from_value(serde_json::json!({
+        "terminal_id": "term_1",
+        "agent_status": "blocked",
+        "workspace_id": "w1",
+        "tab_id": "w1:t1",
+        "pane_id": "w1:p1",
+        "focused": false,
+        "revision": 0
+    }))
+    .unwrap();
+
+    assert!(agent.actions.is_empty());
+}
+
+#[test]
 fn notification_show_request_parses() {
     let json = r#"{"id":"req_1","method":"notification.show","params":{"title":"build failed","body":"api workspace","position":"top-left","sound":"request"}}"#;
     let request: Request = serde_json::from_str(json).unwrap();

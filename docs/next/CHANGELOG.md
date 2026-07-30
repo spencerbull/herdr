@@ -4,6 +4,7 @@
 
 ### Added
 - Custom themes can now define separate light and dark color overrides when automatic theme switching is enabled. (#837, thanks @aneym)
+- Added typed, short-lived agent action capabilities and `agent.perform_action` for guarded dashboard controls. Herdr currently issues only interrupt capabilities for an explicit visible interrupt footer; approval remains reserved but unavailable until a one-time approval prompt can be grounded in verified current UI evidence. Each capability is single-use and revalidated against the live process, terminal/pane identity, state sequence, revision, manifest evidence, and screen fingerprint before one canonical key is queued.
 
 ### Fixed
 - Claude Code integration hooks now ignore Cursor CLI's Claude-compatible session events, preventing Cursor sessions from being stored as resumable Claude sessions. (#2832)

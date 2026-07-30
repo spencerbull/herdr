@@ -326,12 +326,12 @@ pub(super) fn should_skip_detection_update(
 
 pub(super) fn observe_detection_content_change(bytes: &[u8], detection_content_seq: &AtomicU64) {
     if !bytes.is_empty() {
-        detection_content_seq.fetch_add(1, Ordering::Relaxed);
+        detection_content_seq.fetch_add(1, Ordering::Release);
     }
 }
 
 pub(super) fn mark_detection_content_changed(detection_content_seq: &AtomicU64) {
-    detection_content_seq.fetch_add(1, Ordering::Relaxed);
+    detection_content_seq.fetch_add(1, Ordering::Release);
 }
 
 #[cfg(test)]

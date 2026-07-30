@@ -2858,6 +2858,10 @@ impl PaneRuntime {
         self.terminal.detection_text()
     }
 
+    pub(crate) fn detection_content_seq(&self) -> u64 {
+        self.detection_content_seq.load(Ordering::Acquire)
+    }
+
     pub fn terminal_title(&self) -> Option<String> {
         self.terminal.terminal_title()
     }
@@ -3140,6 +3144,7 @@ impl PaneRuntime {
         let (tx, _rx) = mpsc::channel(1);
         let _ = self.terminal.process_pty_bytes(self.pane_id, 0, bytes, &tx);
         self.content_seq.fetch_add(1, Ordering::Release);
+        observe_detection_content_change(bytes, &self.detection_content_seq);
     }
 
     pub(crate) fn test_with_scrollback_bytes(

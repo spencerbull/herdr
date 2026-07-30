@@ -113,6 +113,8 @@ pub enum Method {
     AgentExplain(AgentTarget),
     #[serde(rename = "agent.send_keys")]
     AgentSendKeys(AgentSendKeysParams),
+    #[serde(rename = "agent.perform_action")]
+    AgentPerformAction(AgentPerformActionParams),
     #[serde(rename = "agent.rename")]
     AgentRename(AgentRenameParams),
     #[serde(rename = "agent.view.set")]

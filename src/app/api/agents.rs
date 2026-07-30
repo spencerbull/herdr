@@ -3,8 +3,8 @@ use std::time::Duration;
 use bytes::Bytes;
 
 use crate::api::schema::{
-    AgentPromptParams, AgentRenameParams, AgentSendKeysParams, AgentStartParams, AgentTarget,
-    PaneReadResult, ResponseResult,
+    AgentPerformActionParams, AgentPromptParams, AgentRenameParams, AgentSendKeysParams,
+    AgentStartParams, AgentTarget, PaneReadResult, ResponseResult,
 };
 use crate::app::App;
 
@@ -286,6 +286,25 @@ impl App {
 
         encode_success(id, ResponseResult::Ok {})
     }
+
+    pub(super) fn handle_agent_perform_action(
+        &mut self,
+        id: String,
+        params: AgentPerformActionParams,
+    ) -> String {
+        let capability = match self.perform_agent_action(&params.capability_id) {
+            Ok(capability) => capability,
+            Err(error) => return encode_error_body(id, error),
+        };
+        encode_success(
+            id,
+            ResponseResult::AgentActionPerformed {
+                action: capability.action,
+                terminal_id: capability.terminal_id,
+                pane_id: capability.pane_id,
+            },
+        )
+    }
 }
 
 fn agent_not_ready(id: String, target: &str) -> String {
@@ -308,12 +327,17 @@ fn agent_not_found(id: String, target: &str) -> String {
 mod tests {
     use super::*;
     use crate::{
-        api::schema::{AgentStatus, SuccessResponse},
+        api::schema::{
+            AgentActionCapability, AgentActionKind, AgentStatus, ErrorResponse, SuccessResponse,
+        },
         app::Mode,
         config::Config,
         detect::{Agent, AgentState},
         workspace::Workspace,
     };
+
+    const CODEX_INTERRUPT_SCREEN: &[u8] =
+        b"\xe2\x80\xa2 Working (4s \xe2\x80\xa2 esc to interrupt)\n";
 
     fn app_with_agent() -> App {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -330,6 +354,258 @@ mod tests {
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
         app
+    }
+
+    fn app_with_codex_action_screen(
+        state: AgentState,
+        screen: &[u8],
+    ) -> (
+        App,
+        crate::layout::PaneId,
+        tokio::sync::mpsc::Receiver<Bytes>,
+    ) {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("reviewer".into());
+        terminal.set_detected_state(Some(Agent::Codex), state);
+        terminal.last_agent_state_change_seq = Some(7);
+        let (runtime, rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                100, 24, 0, screen, 4,
+            );
+        app.state.insert_test_runtime(pane_id, runtime);
+        (app, pane_id, rx)
+    }
+
+    fn only_action(
+        app: &App,
+        pane_id: crate::layout::PaneId,
+        action: AgentActionKind,
+    ) -> AgentActionCapability {
+        let info = app.agent_info(0, pane_id).unwrap();
+        assert_eq!(info.actions.len(), 1);
+        assert_eq!(info.actions[0].action, action);
+        info.actions[0].clone()
+    }
+
+    #[tokio::test]
+    async fn blocked_prompts_do_not_expose_approval_actions() {
+        for screen in [
+            b"continue? [y/n]\n".as_slice(),
+            CODEX_INTERRUPT_SCREEN,
+            b"Allow command?\n\
+$ cargo test\n\
+\xe2\x80\xba 1. Yes, proceed (y)\n\
+Press enter to confirm or esc to cancel\n"
+                .as_slice(),
+            b"Would you like to run the following command?\n\
+$ cargo test\n\
+\xe2\x80\xba Yes, just this once\n\
+No, and tell Codex what to do differently\n"
+                .as_slice(),
+        ] {
+            let (app, pane_id, _rx) = app_with_codex_action_screen(AgentState::Blocked, screen);
+            assert!(app.agent_info(0, pane_id).unwrap().actions.is_empty());
+        }
+
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0]
+            .terminal_id(pane_id)
+            .unwrap()
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_hook_authority(
+            "herdr:omp".into(),
+            "omp".into(),
+            AgentState::Working,
+            None,
+            Some(1),
+        );
+        assert!(terminal.full_lifecycle_hook_authority_active());
+        let (runtime, _rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                100,
+                24,
+                0,
+                CODEX_INTERRUPT_SCREEN,
+                4,
+            );
+        app.state.insert_test_runtime(pane_id, runtime);
+        assert!(app.agent_info(0, pane_id).unwrap().actions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn guarded_interrupt_requires_visible_chrome_sends_escape_once_and_rejects_replay() {
+        let (mut app, pane_id, mut rx) =
+            app_with_codex_action_screen(AgentState::Working, CODEX_INTERRUPT_SCREEN);
+        let capability = only_action(&app, pane_id, AgentActionKind::Interrupt);
+        assert_eq!(capability.evidence.rule_id, "screen_working_fallback");
+
+        let response = app.handle_agent_perform_action(
+            "interrupt".into(),
+            AgentPerformActionParams {
+                capability_id: capability.capability_id.clone(),
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(
+            success.result,
+            ResponseResult::AgentActionPerformed {
+                action: AgentActionKind::Interrupt,
+                ..
+            }
+        ));
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"\x1b"));
+        assert!(rx.try_recv().is_err());
+        assert!(app.agent_info(0, pane_id).unwrap().actions.is_empty());
+
+        let replay = app.handle_agent_perform_action(
+            "interrupt-replay".into(),
+            AgentPerformActionParams {
+                capability_id: capability.capability_id,
+            },
+        );
+        let error: ErrorResponse = serde_json::from_str(&replay).unwrap();
+        assert_eq!(error.error.code, "agent_action_capability_not_found");
+        assert!(rx.try_recv().is_err());
+
+        let (app, pane_id, _rx) =
+            app_with_codex_action_screen(AgentState::Working, b"still working\n");
+        assert!(app.agent_info(0, pane_id).unwrap().actions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn changed_screen_state_sequence_revision_and_pane_identity_reject_old_actions() {
+        let (mut app, pane_id, mut rx) =
+            app_with_codex_action_screen(AgentState::Working, CODEX_INTERRUPT_SCREEN);
+        let capability = only_action(&app, pane_id, AgentActionKind::Interrupt);
+        app.lookup_runtime_sender(0, pane_id)
+            .unwrap()
+            .test_process_pty_bytes(b"\nchanged");
+        let response = app.handle_agent_perform_action(
+            "screen-changed".into(),
+            AgentPerformActionParams {
+                capability_id: capability.capability_id,
+            },
+        );
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "agent_action_capability_stale");
+        assert!(rx.try_recv().is_err());
+
+        let (mut app, pane_id, mut rx) =
+            app_with_codex_action_screen(AgentState::Working, CODEX_INTERRUPT_SCREEN);
+        let capability = only_action(&app, pane_id, AgentActionKind::Interrupt);
+        let terminal_id = app.state.workspaces[0]
+            .terminal_id(pane_id)
+            .unwrap()
+            .clone();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .last_agent_state_change_seq = Some(8);
+        let response = app.handle_agent_perform_action(
+            "sequence-changed".into(),
+            AgentPerformActionParams {
+                capability_id: capability.capability_id,
+            },
+        );
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "agent_action_capability_stale");
+        assert!(rx.try_recv().is_err());
+
+        let (mut app, pane_id, mut rx) =
+            app_with_codex_action_screen(AgentState::Working, CODEX_INTERRUPT_SCREEN);
+        let capability = only_action(&app, pane_id, AgentActionKind::Interrupt);
+        let terminal_id = app.state.workspaces[0]
+            .terminal_id(pane_id)
+            .unwrap()
+            .clone();
+        app.state.terminals.get_mut(&terminal_id).unwrap().revision += 1;
+        let response = app.handle_agent_perform_action(
+            "revision-changed".into(),
+            AgentPerformActionParams {
+                capability_id: capability.capability_id,
+            },
+        );
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "agent_action_capability_stale");
+        assert!(rx.try_recv().is_err());
+
+        let (mut app, pane_id, mut rx) =
+            app_with_codex_action_screen(AgentState::Working, CODEX_INTERRUPT_SCREEN);
+        let capability = only_action(&app, pane_id, AgentActionKind::Interrupt);
+        app.state.workspaces[0]
+            .public_pane_numbers
+            .insert(pane_id, 2);
+        let response = app.handle_agent_perform_action(
+            "pane-moved".into(),
+            AgentPerformActionParams {
+                capability_id: capability.capability_id,
+            },
+        );
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "agent_action_capability_stale");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn server_epoch_and_failed_send_invalidate_capabilities_without_retry() {
+        let (mut app, pane_id, mut rx) =
+            app_with_codex_action_screen(AgentState::Working, CODEX_INTERRUPT_SCREEN);
+        let capability = only_action(&app, pane_id, AgentActionKind::Interrupt);
+        app.agent_action_registry
+            .expire_for_test(&capability.capability_id);
+        let response = app.handle_agent_perform_action(
+            "expired".into(),
+            AgentPerformActionParams {
+                capability_id: capability.capability_id,
+            },
+        );
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "agent_action_capability_expired");
+        assert!(rx.try_recv().is_err());
+
+        let (mut app, pane_id, mut rx) =
+            app_with_codex_action_screen(AgentState::Working, CODEX_INTERRUPT_SCREEN);
+        let capability = only_action(&app, pane_id, AgentActionKind::Interrupt);
+        app.agent_action_registry = crate::app::agent_actions::AgentActionRegistry::new();
+        let response = app.handle_agent_perform_action(
+            "old-epoch".into(),
+            AgentPerformActionParams {
+                capability_id: capability.capability_id,
+            },
+        );
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "agent_action_capability_not_found");
+        assert!(rx.try_recv().is_err());
+
+        let (mut app, pane_id, rx) =
+            app_with_codex_action_screen(AgentState::Working, CODEX_INTERRUPT_SCREEN);
+        let capability = only_action(&app, pane_id, AgentActionKind::Interrupt);
+        drop(rx);
+        let response = app.handle_agent_perform_action(
+            "closed-channel".into(),
+            AgentPerformActionParams {
+                capability_id: capability.capability_id.clone(),
+            },
+        );
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "agent_action_failed");
+        let replay = app.handle_agent_perform_action(
+            "closed-channel-replay".into(),
+            AgentPerformActionParams {
+                capability_id: capability.capability_id,
+            },
+        );
+        let error: ErrorResponse = serde_json::from_str(&replay).unwrap();
+        assert_eq!(error.error.code, "agent_action_capability_not_found");
+        assert!(app.agent_info(0, pane_id).unwrap().actions.is_empty());
     }
 
     #[tokio::test]
