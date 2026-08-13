@@ -102,7 +102,7 @@ herdr pane read w1:p2 --source recent --lines 50
 | ペイン | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.rename`、`pane.send_text`、`pane.send_keys`、`pane.send_input`、`pane.read`、`pane.graphics.info`、`pane.graphics.set`、`pane.graphics.clear`、`pane.graphics.stream`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.wait_for_output` |
 | ポップアップ | `popup.close` |
 | レイアウト | `layout.export`、`layout.apply`、`layout.set_split_ratio` |
-| エージェント | `agent.list`、`agent.order.get`、`agent.order.set`、`agent.get`、`agent.read`、`agent.explain`、`agent.send_keys`、`agent.prompt`、`agent.wait`、`agent.rename`、`agent.focus`、`agent.start` |
+| エージェント | `agent.list`、`agent.order.get`、`agent.order.set`、`agent.get`、`agent.read`、`agent.explain`、`agent.send_keys`、`agent.perform_action`、`agent.prompt`、`agent.wait`、`agent.rename`、`agent.focus`、`agent.start`、`agent.view.set`、`agent.view.clear` |
 | イベント | `events.subscribe`、`events.wait` |
 | インテグレーション | `integration.install`、`integration.uninstall` |
 | プラグイン | `plugin.link`、`plugin.list`、`plugin.unlink`、`plugin.enable`、`plugin.disable`、`plugin.action.list`、`plugin.action.invoke`、`plugin.log.list`、`plugin.pane.open`、`plugin.pane.focus`、`plugin.pane.close` |
@@ -585,6 +585,57 @@ Herdr に保存されたネイティブセッション参照があるとき、`p
 `pane.get`、`pane.list`、`agent.get`、`agent.list` は、ペインの PTY を現在制御しているプロセスの cwd を解決できるときに `foreground_cwd` も公開します。既存の `cwd` フィールドは、ラベル、follow-cwd 挙動、復元されたセッション状態に使われるペイン/ワークスペースの cwd のままです。
 
 `PaneInfo` と `AgentInfo` は、任意の `terminal_title` と `terminal_title_stripped` フィールドを公開します。`terminal_title` は、安全性のための正規化を行った最新の OSC 0/2 タイトルです。`terminal_title_stripped` は、先頭にある認識済みのアクティビティまたはスピナーのグリフ 1 つと、それに続く空白を除去します。これらはサーバーが所有する値で、コールドリスタートをまたいで保持されず、メタデータの `title` や意味的なエージェント状態から独立しています。
+
+## ガード付きエージェントアクション
+
+`agent.get`、`agent.list`、`session.snapshot` は、エージェントレコードに
+`actions` 配列を公開することがあります。各要素は、サーバーが所有する 1 つの
+アクションに対する短寿命のケイパビリティです:
+
+```json
+{
+  "actions": [{
+    "capability_id": "act_...",
+    "action": "interrupt",
+    "terminal_id": "term_...",
+    "workspace_id": "w1",
+    "tab_id": "w1:t1",
+    "pane_id": "w1:p1",
+    "agent": "codex",
+    "agent_status": "working",
+    "state_change_seq": 42,
+    "revision": 3,
+    "expires_at_unix_ms": 1785384000000,
+    "evidence": {
+      "manifest_source": "bundled",
+      "manifest_version": "2026.07.18.1",
+      "rule_id": "screen_working_fallback"
+    }
+  }]
+}
+```
+
+アクションを実行するには、不透明なケイパビリティ ID だけを返します:
+
+```json
+{
+  "id": "req_action",
+  "method": "agent.perform_action",
+  "params": { "capability_id": "act_..." }
+}
+```
+
+ケイパビリティはプロセスメモリにのみ保存され、30 秒で期限切れになり、再検証と入力の前に消費されます。入力をキューへ追加できなかった場合も含め、消費済みのケイパビリティは再試行されません。サーバーの再起動またはライブハンドオフは、それ以前のケイパビリティをすべて無効化します。不明、期限切れ、消費済み、または以前のサーバーが発行した ID は、すべて `agent_action_capability_not_found` を返します。
+
+サーバーは、ターミナル、現在のペイン/ワークスペース/タブ ID、正確なフォアグラウンドエージェントプロセスインスタンス（PID、プロセス開始/作成 ID、およびプラットフォームが提供する場合はプロセスグループで照合）、意味的状態、状態変更シーケンス、リビジョン、信頼済みバンドルマニフェストの証拠、検出コンテンツシーケンス、および画面と OSC の証拠のフィンガープリントを再解決して再確認します。その後、サーバーが選択した 1 キーだけを送信します。`approve` なら Enter、`interrupt` なら Escape です。リクエスト側は対象、アクション、生のキーペイロードを選択できません。ガード付きアクションは、ターミナルのキーボードプロトコルに依存しない 1 つの正規バイト（`CR` または `ESC`）を使います。
+
+ガード付き書き込みは、通常の非同期入力キューを使いません。Herdr は、先行するユーザー入力がキューに残っていない場合にだけ受け付け、後続のユーザー入力が割り込むことを防ぎ、検証の前後で読み取り可能になっている PTY 出力を消費し、PTY ライター内で正確なプロセスと一貫した画面/OSC スナップショットを再検証し、1 バイトの書き込みが成功した後にだけ成功を報告します。バックプレッシャーを受けた書き込みは短い期限後にキャンセルされ、エラーレスポンス後に遅れて書き込まれることはありません。同期 ConPTY ライターを安全にキャンセルできないため、Windows では現在ガード付きケイパビリティを発行しません。Herdr が通常のキューへフォールバックすることもありません。
+
+`approve` は型付きアクション列挙で予約されていますが、Herdr はまだ承認ケイパビリティを発行しません。現在のプロンプト群には、Enter が 1 回限りの承認を意味すると証明できる、検証済みでアクション固有の画面ルールがありません。汎用確認、構造化された質問、選択済みの権限ポリシー、弱い `[y/n]` プロンプトだけでは不十分です。`interrupt` ケイパビリティには、現在画面に表示されている `esc to interrupt` の作業中フッターに対する、信頼済みバンドルルールとの完全一致が必要です。ローカル上書き、ダウンロード済みマニフェスト、スピナー、ライフサイクル状態だけでは対象になりません。
+
+再検証は意図的に保守的であり、再描画、状態変更、プロセス置換、キュー済み入力、ライターのバックプレッシャーの後はアクションを拒否できます。同じ種類の置換プロセスは以前のプロセスの画面を継承できません。最初のプロセス観測時と置換のたびに、Herdr はバッファ済み PTY 出力を排出し、正確なプロセスを再確認してから検出ベースラインを記録します。その境界ですでに見えていた信頼済み証拠は、ケイパビリティを発行できるようになる前に一度消え、後で再表示されなければなりません。証拠のない境界の後に初めて描画された証拠は通常どおり対象になります。このプロセス証拠の鮮度を進めるのは実際の PTY 出力だけです。ローカルのリサイズやリフローは既存のケイパビリティを無効化できますが、継承された証拠を新鮮にはできません。PID とプロセス開始 ID を保つインプレース `exec` はプロセス継続であり、検出された置換境界ではありません。環境ヒントは表示用のエージェント識別には使えますが、ガード付きアクションに必要な正確な実行ファイル ID を確立できません。
+
+残る競合は、最終的なライター境界の検証結果から 1 バイトの PTY 書き込みシステムコールまでの間です。この間にも外部プロセスは変化できるため、クライアントはこのアクションをトランザクション的にアトミックではなく、ライター境界で再検証されたものとして説明してください。拒否または失敗した ID を再試行せず、エージェント状態を更新し、新しく発行されたケイパビリティを待ってください。
 
 ユーザーフックが Herdr インテグレーションからライフサイクル状態を奪わずに表示をカスタマイズしたいときは `pane.report_metadata` を使ってください。
 

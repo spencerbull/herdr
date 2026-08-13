@@ -102,7 +102,7 @@ herdr pane read w1:p2 --source recent --lines 50
 | 窗格 | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.rename`、`pane.send_text`、`pane.send_keys`、`pane.send_input`、`pane.read`、`pane.graphics.info`、`pane.graphics.set`、`pane.graphics.clear`、`pane.graphics.stream`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.wait_for_output` |
 | 弹窗 | `popup.close` |
 | 布局 | `layout.export`、`layout.apply`、`layout.set_split_ratio` |
-| 智能体 | `agent.list`、`agent.order.get`、`agent.order.set`、`agent.get`、`agent.read`、`agent.explain`、`agent.send_keys`、`agent.prompt`、`agent.wait`、`agent.rename`、`agent.focus`、`agent.start` |
+| 智能体 | `agent.list`、`agent.order.get`、`agent.order.set`、`agent.get`、`agent.read`、`agent.explain`、`agent.send_keys`、`agent.perform_action`、`agent.prompt`、`agent.wait`、`agent.rename`、`agent.focus`、`agent.start`、`agent.view.set`、`agent.view.clear` |
 | 事件 | `events.subscribe`、`events.wait` |
 | 集成 | `integration.install`、`integration.uninstall` |
 | 插件 | `plugin.link`、`plugin.list`、`plugin.unlink`、`plugin.enable`、`plugin.disable`、`plugin.action.list`、`plugin.action.invoke`、`plugin.log.list`、`plugin.pane.open`、`plugin.pane.focus`、`plugin.pane.close` |
@@ -581,6 +581,56 @@ Herdr 存有原生会话引用时,`pane.get`、`pane.list`、`agent.get` 和 `ag
 当 Herdr 能解析当前控制窗格 PTY 的进程的 cwd 时,`pane.get`、`pane.list`、`agent.get` 和 `agent.list` 也暴露 `foreground_cwd`。已有的 `cwd` 字段仍然是用于标签、follow-cwd 行为和恢复会话状态的窗格/工作区 cwd。
 
 `PaneInfo` 和 `AgentInfo` 暴露可选的 `terminal_title` 和 `terminal_title_stripped` 字段。`terminal_title` 是经过安全规范化的最新 OSC 0/2 标题。`terminal_title_stripped` 会移除开头一个已识别的活动或旋转指示符字形及其后的空白。这些值归服务器所有,冷重启后不会保留,并且独立于元数据 `title` 和语义智能体状态。
+
+## 受保护的智能体操作
+
+`agent.get`、`agent.list` 和 `session.snapshot` 可能在智能体记录中暴露一个
+`actions` 数组。每个条目都是针对一个服务器所有操作的短期能力:
+
+```json
+{
+  "actions": [{
+    "capability_id": "act_...",
+    "action": "interrupt",
+    "terminal_id": "term_...",
+    "workspace_id": "w1",
+    "tab_id": "w1:t1",
+    "pane_id": "w1:p1",
+    "agent": "codex",
+    "agent_status": "working",
+    "state_change_seq": 42,
+    "revision": 3,
+    "expires_at_unix_ms": 1785384000000,
+    "evidence": {
+      "manifest_source": "bundled",
+      "manifest_version": "2026.07.18.1",
+      "rule_id": "screen_working_fallback"
+    }
+  }]
+}
+```
+
+执行操作时只返回其不透明的能力 ID:
+
+```json
+{
+  "id": "req_action",
+  "method": "agent.perform_action",
+  "params": { "capability_id": "act_..." }
+}
+```
+
+能力只存在于进程内存中,30 秒后过期,并在重新验证和输入之前被消耗。已消耗的能力绝不重试,包括输入无法入队的情况。服务器重启或实时交接会使此前的所有能力失效。未知、已过期、已消耗以及由旧服务器签发的 ID 都返回 `agent_action_capability_not_found`。
+
+服务器会重新解析并检查终端、当前窗格/工作区/标签页身份、精确的前台智能体进程实例（按 PID、进程启动/创建身份以及平台可提供时的进程组匹配）、语义状态、状态变更序号、修订号、可信内置清单证据、检测内容序号,以及屏幕和 OSC 证据的指纹。然后它只发送一个由服务器选择的按键:`approve` 使用 Enter,`interrupt` 使用 Escape。请求不能选择目标、操作或原始按键载荷。受保护操作使用一个不依赖终端键盘协议的规范字节（`CR` 或 `ESC`）。
+
+受保护写入不使用普通的异步输入队列。只有在没有更早的用户输入仍在排队时,Herdr 才接受该写入;它会阻止后续用户输入插入,在验证前后消费已经可读的 PTY 输出,在 PTY 写入器内重新验证精确进程和一致的屏幕/OSC 快照,并且仅在单字节写入成功后报告成功。受到背压的写入会在短期限后取消,不会在错误响应之后延迟写入。由于同步 ConPTY 写入器无法安全取消,Windows 目前不签发受保护能力;Herdr 也不会回退到普通队列。
+
+`approve` 已在类型化操作枚举中保留,但 Herdr 暂不签发批准能力。当前的提示系列没有经过验证、操作特定的屏幕规则来证明 Enter 表示一次性批准;通用确认、结构化问题、已选择的权限策略和弱 `[y/n]` 提示都不足以证明这一点。`interrupt` 能力要求当前屏幕上的 `esc to interrupt` 工作中页脚与可信内置规则精确匹配;本地覆盖、下载的清单、旋转指示符或单独的生命周期状态都不符合条件。
+
+重新验证有意采用保守策略,任何重绘、状态变更、进程替换、已排队输入或写入器背压之后都可能拒绝操作。同类替换进程不能继承前一进程的屏幕:首次观察进程以及每次替换时,Herdr 会排空缓冲的 PTY 输出,重新检查精确进程,然后才记录检测基线。在该边界处已经可见的可信证据必须先消失再重新出现,才能签发能力。在无证据边界之后首次绘制的证据可以正常符合条件。只有实际 PTY 输出会推进进程证据的新鲜度;本地调整大小或重排可以使现有能力失效,但不能让继承的证据变得新鲜。保留 PID 和进程启动身份的原地 `exec` 属于进程连续性,不是检测到的替换边界。环境提示可用于展示层的智能体识别,但不能建立受保护操作所需的精确可执行文件身份。
+
+剩余竞态位于最终写入器边界验证返回与单字节 PTY 写入系统调用之间;外部进程在这段间隔内仍可能变化。因此客户端应把该操作描述为在写入器边界重新验证,而不是事务性原子操作。不要重试被拒绝或失败的 ID;应刷新智能体状态并等待新签发的能力。
 
 当用户钩子想自定义展示、又不从 Herdr 集成接管生命周期状态时,使用 `pane.report_metadata`。
 
