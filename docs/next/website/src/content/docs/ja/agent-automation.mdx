@@ -67,11 +67,14 @@ herdr agent rename w1:p2 reviewer
 | 既存のペインで対応済みエージェントを起動する | `agent start` |
 | プロンプトを送信し、必要なら完了を待つ | `agent prompt` |
 | エージェントの対話 UI にキーを送る | `agent send-keys` |
+| サーバーで保護された操作（現在は中断）を実行する | 現在の `AgentInfo.actions` capability を使う Raw API `agent.perform_action` |
 | エージェントのライフサイクル状態を待つ | `agent wait` |
 
 `agent prompt` はテキストを送信し、短い遅延の後にエンコード済み Enter を送信します。ターミナルの現在の bracketed paste モードを尊重します。working 中のエージェントにも送信できます。エージェントがすでに `blocked` の場合は、ターミナル入力を送信せずに `agent_blocked` を返します。ダイアログを確認し、意図した応答には `agent send-keys` を使ってください。`esc`、`up`、`enter`、`ctrl+c` のような操作には `agent send-keys` を使います。`escape` も `esc` のエイリアスとして使えます。意図的に生のターミナルを操作したい場合は、ペイン入力コマンドを使ってください。
 
 ペイン入力は、現在のプロセスに関係なくターミナルを指定します。エージェント入力はライブエージェントを解決し、そのエージェントがペインを制御しなくなっていれば操作を拒否します。
+
+ダッシュボードやタッチ操作では、`blocked` / `working` 状態から推測して `agent send-keys` を呼び出すのではなく、`AgentInfo.actions` の型付き capability を優先してください。`agent.perform_action` が受け取るのは opaque capability ID だけです。Herdr は canonical key を 1 回送る前に、正確なプロセス、ターミナル／ペイン identity、状態、manifest evidence、screen fingerprint を再検証します。capability は短時間だけ有効で、1 回しか使用できません。capability がない場合、より広い lifecycle status が `blocked` または `working` でも、現在の UI はその操作向けに確実には分類されていません。approval は予約済みですが、one-time approval として現在の prompt を検証できるまでは意図的に利用できません。現時点では、明示的に表示された interrupt footer だけが対象です。
 
 `agent prompt --wait` は、エージェントがすでに `blocked` でない限り、プロンプトをすぐ送信します。すでに `blocked` の場合は待機を開始せずに `agent_blocked` を返します。受け付けたプロンプトが別の non-working 状態から始まる場合、Herdr はまず 5 秒以内にライフサイクル変化が観測されることを要求します。状態シーケンスが進まなければ、無期限に待たず `agent_prompt_stalled` を返します。呼び出し側の `--timeout` が 5 秒以下なら、通常の `timeout` エラーを返します。活動を観測した後、要求された安定状態を待ちます。個々のターンは追跡しません。エージェントがすでに working の場合、進行中ターンの完了が待機を満たすことがあります。単独の `agent wait` は現在のエージェントを監視し、すでに状態が一致していれば即座に返ります。どちらもデフォルトでは `idle`、`done`、`blocked` を待ちます。複数の正確な状態を許可するには、`--until idle --until done` のように `--until` を繰り返します。`unknown` が必要な場合は `--until unknown` を明示してください。`agent prompt` では `--until` に `--wait` が必要です。
 

@@ -517,6 +517,48 @@ No, and tell Codex what to do differently\n"
     }
 
     #[tokio::test]
+    async fn non_working_agents_skip_process_instance_reads() {
+        let (app, pane_id, _rx) =
+            app_with_codex_action_screen(AgentState::Idle, CODEX_INTERRUPT_SCREEN);
+        crate::app::agents::reset_runtime_agent_process_instance_reads();
+
+        assert!(app.agent_info(0, pane_id).unwrap().actions.is_empty());
+        assert_eq!(
+            crate::app::agents::runtime_agent_process_instance_reads(),
+            0,
+            "non-working agent listings must not inspect process identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn sustained_output_boundary_does_not_block_or_retry_agent_listing() {
+        let (app, pane_id, _rx) =
+            app_with_codex_action_screen(AgentState::Working, CODEX_INTERRUPT_SCREEN);
+        let runtime = app.lookup_runtime_sender(0, pane_id).unwrap();
+        runtime.test_replace_agent_process_instance();
+        runtime.test_hold_output_boundaries();
+        let requests_before = runtime.test_output_boundary_request_count();
+        let started = std::time::Instant::now();
+
+        assert!(app.agent_info(0, pane_id).unwrap().actions.is_empty());
+        runtime.test_fail_pending_output_boundaries();
+        for _ in 0..100 {
+            runtime.test_process_pty_bytes(b"sustained output\r\n");
+            assert!(app.agent_info(0, pane_id).unwrap().actions.is_empty());
+        }
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(250),
+            "agent listing must not wait for the 500 ms PTY boundary deadline"
+        );
+        assert_eq!(
+            runtime.test_output_boundary_request_count() - requests_before,
+            1,
+            "one in-flight boundary probe must cover repeated listings"
+        );
+    }
+
+    #[tokio::test]
     async fn guarded_interrupt_requires_visible_chrome_sends_escape_once_and_rejects_replay() {
         let (mut app, pane_id, mut rx) =
             app_with_codex_action_screen(AgentState::Working, CODEX_INTERRUPT_SCREEN);

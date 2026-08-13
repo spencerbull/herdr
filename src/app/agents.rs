@@ -438,6 +438,23 @@ pub(super) struct AgentProcessInstance {
     pub(super) process_group_id: Option<u32>,
 }
 
+#[cfg(test)]
+thread_local! {
+    static RUNTIME_AGENT_PROCESS_INSTANCE_READS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[cfg(test)]
+pub(super) fn reset_runtime_agent_process_instance_reads() {
+    RUNTIME_AGENT_PROCESS_INSTANCE_READS.set(0);
+}
+
+#[cfg(test)]
+pub(super) fn runtime_agent_process_instance_reads() -> usize {
+    RUNTIME_AGENT_PROCESS_INSTANCE_READS.get()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AgentProcessIdentificationProvenance {
     Executable,
@@ -514,6 +531,10 @@ pub(super) fn runtime_agent_process_instance(
     runtime: &crate::terminal::TerminalRuntime,
     expected: crate::detect::Agent,
 ) -> Option<AgentProcessInstance> {
+    #[cfg(test)]
+    RUNTIME_AGENT_PROCESS_INSTANCE_READS
+        .set(RUNTIME_AGENT_PROCESS_INSTANCE_READS.get().saturating_add(1));
+
     #[cfg(test)]
     if runtime.child_pid().is_none() {
         return Some(AgentProcessInstance {

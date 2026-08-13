@@ -15,7 +15,7 @@ use tracing::{debug, warn};
 
 use crate::pty::fd;
 
-use super::{GuardedWriteError, GuardedWriteValidator};
+use super::{GuardedWriteError, GuardedWriteValidator, OutputBoundaryRequest};
 
 // Actor handle methods must call wake_actor() after queuing work. The idle
 // timeout is only a fallback for missed wakes; PTY and wake readiness drive
@@ -241,7 +241,9 @@ impl PtyIoActorHandle {
         true
     }
 
-    pub(crate) fn drain_output_boundary(&self) -> Result<(), GuardedWriteError> {
+    pub(crate) fn request_output_boundary(
+        &self,
+    ) -> Result<OutputBoundaryRequest, GuardedWriteError> {
         let (reply_tx, reply_rx) = std_mpsc::channel();
         self.control_tx
             .send(PtyIoControlCommand::DrainOutputBoundary {
@@ -250,11 +252,7 @@ impl PtyIoActorHandle {
             })
             .map_err(|_| GuardedWriteError::Closed)?;
         self.wake_actor();
-        match reply_rx.recv_timeout(GUARDED_WRITE_TIMEOUT) {
-            Ok(result) => result,
-            Err(std_mpsc::RecvTimeoutError::Disconnected) => Err(GuardedWriteError::Closed),
-            Err(std_mpsc::RecvTimeoutError::Timeout) => Err(GuardedWriteError::TimedOut),
-        }
+        Ok(OutputBoundaryRequest::new(reply_rx))
     }
 
     pub(crate) fn write_terminal_response(&self, response: impl FnOnce() -> Option<Bytes>) {
@@ -1238,6 +1236,17 @@ mod tests {
         }))
     }
 
+    fn wait_output_boundary(request: &OutputBoundaryRequest) -> Result<(), GuardedWriteError> {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match request.poll()? {
+                Some(()) => return Ok(()),
+                None if Instant::now() < deadline => std::thread::yield_now(),
+                None => return Err(GuardedWriteError::TimedOut),
+            }
+        }
+    }
+
     fn actor_with_socket_pair(
         initially_quiesced: bool,
     ) -> (PtyIoActorHandle, UnixStream, std_mpsc::Receiver<Bytes>) {
@@ -1363,9 +1372,10 @@ mod tests {
         peer.write_all(b"old process footer")
             .expect("old process output reaches actor fd");
 
-        handle
-            .drain_output_boundary()
-            .expect("output boundary succeeds");
+        let request = handle
+            .request_output_boundary()
+            .expect("output boundary request accepted");
+        wait_output_boundary(&request).expect("output boundary succeeds");
 
         assert_eq!(
             read_rx.try_recv().expect("output callback completed"),
@@ -1894,7 +1904,10 @@ mod tests {
         peer.write_all(b"held during handoff")
             .expect("peer write during quiesce");
 
-        assert_eq!(handle.drain_output_boundary(), Err(GuardedWriteError::Busy));
+        let request = handle
+            .request_output_boundary()
+            .expect("output boundary request accepted");
+        assert_eq!(wait_output_boundary(&request), Err(GuardedWriteError::Busy));
         assert!(
             read_rx.recv_timeout(Duration::from_millis(150)).is_err(),
             "output boundary must preserve quiesced unread bytes"

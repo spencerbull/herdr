@@ -31,6 +31,7 @@ struct AgentActionRegistryInner {
     active: HashMap<String, StoredAgentActionCapability>,
     slots: HashMap<AgentActionSlot, AgentActionSlotState>,
     process_evidence: HashMap<String, AgentActionProcessEvidenceState>,
+    boundary_probes: HashMap<String, AgentActionBoundaryProbeState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -57,6 +58,24 @@ struct AgentActionProcessEvidenceState {
 enum AgentActionEvidenceFreshness {
     AwaitingAbsence,
     AwaitingReturn,
+    Ready,
+}
+
+enum AgentActionBoundaryProbeState {
+    InFlight {
+        process_instance: super::agents::AgentProcessInstance,
+        request: crate::pty::actor::OutputBoundaryRequest,
+    },
+    AwaitingQuietOutput {
+        process_instance: super::agents::AgentProcessInstance,
+        observed_output_seq: u64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentActionBoundaryProbeStatus {
+    Start,
+    Pending,
     Ready,
 }
 
@@ -212,6 +231,108 @@ impl AgentActionRegistry {
             .is_none_or(|state| state.process_instance != process_instance)
     }
 
+    fn poll_process_boundary_probe(
+        &self,
+        terminal_id: &str,
+        process_instance: super::agents::AgentProcessInstance,
+        pty_output_seq: u64,
+    ) -> AgentActionBoundaryProbeStatus {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(probe) = inner.boundary_probes.remove(terminal_id) else {
+            return AgentActionBoundaryProbeStatus::Start;
+        };
+
+        match probe {
+            AgentActionBoundaryProbeState::InFlight {
+                process_instance: probe_process,
+                request,
+            } if probe_process == process_instance => match request.poll() {
+                Ok(Some(())) => AgentActionBoundaryProbeStatus::Ready,
+                Ok(None) => {
+                    inner.boundary_probes.insert(
+                        terminal_id.to_string(),
+                        AgentActionBoundaryProbeState::InFlight {
+                            process_instance,
+                            request,
+                        },
+                    );
+                    AgentActionBoundaryProbeStatus::Pending
+                }
+                Err(_) => {
+                    inner.boundary_probes.insert(
+                        terminal_id.to_string(),
+                        AgentActionBoundaryProbeState::AwaitingQuietOutput {
+                            process_instance,
+                            observed_output_seq: pty_output_seq,
+                        },
+                    );
+                    AgentActionBoundaryProbeStatus::Pending
+                }
+            },
+            AgentActionBoundaryProbeState::AwaitingQuietOutput {
+                process_instance: probe_process,
+                observed_output_seq,
+            } if probe_process == process_instance && observed_output_seq != pty_output_seq => {
+                inner.boundary_probes.insert(
+                    terminal_id.to_string(),
+                    AgentActionBoundaryProbeState::AwaitingQuietOutput {
+                        process_instance,
+                        observed_output_seq: pty_output_seq,
+                    },
+                );
+                AgentActionBoundaryProbeStatus::Pending
+            }
+            AgentActionBoundaryProbeState::AwaitingQuietOutput {
+                process_instance: probe_process,
+                observed_output_seq,
+            } if probe_process == process_instance && observed_output_seq == pty_output_seq => {
+                AgentActionBoundaryProbeStatus::Start
+            }
+            _ => AgentActionBoundaryProbeStatus::Start,
+        }
+    }
+
+    fn start_process_boundary_probe(
+        &self,
+        terminal_id: &str,
+        process_instance: super::agents::AgentProcessInstance,
+        request: crate::pty::actor::OutputBoundaryRequest,
+    ) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.boundary_probes.insert(
+            terminal_id.to_string(),
+            AgentActionBoundaryProbeState::InFlight {
+                process_instance,
+                request,
+            },
+        );
+    }
+
+    fn defer_process_boundary_probe(
+        &self,
+        terminal_id: &str,
+        process_instance: super::agents::AgentProcessInstance,
+        pty_output_seq: u64,
+    ) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.boundary_probes.insert(
+            terminal_id.to_string(),
+            AgentActionBoundaryProbeState::AwaitingQuietOutput {
+                process_instance,
+                observed_output_seq: pty_output_seq,
+            },
+        );
+    }
+
     fn record_process_boundary(
         &self,
         terminal_id: &str,
@@ -223,6 +344,7 @@ impl AgentActionRegistry {
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.boundary_probes.remove(terminal_id);
         inner.process_evidence.insert(
             terminal_id.to_string(),
             AgentActionProcessEvidenceState {
@@ -292,6 +414,7 @@ impl AgentActionRegistry {
             .slots
             .retain(|slot, _| slot.terminal_id != terminal_id);
         inner.process_evidence.remove(terminal_id);
+        inner.boundary_probes.remove(terminal_id);
     }
 
     #[cfg(test)]
@@ -536,6 +659,9 @@ impl App {
         {
             return None;
         }
+        if pane.agent_status != AgentStatus::Working {
+            return None;
+        }
         let expected_agent = terminal.effective_known_agent()?;
         let runtime = self.lookup_runtime_sender(ws_idx, pane_id)?;
         if !runtime.guarded_writes_supported() {
@@ -543,14 +669,43 @@ impl App {
         }
         let process_instance =
             super::agents::runtime_agent_process_instance(runtime, expected_agent)?;
-        if pane.agent_status != AgentStatus::Working {
-            return None;
-        }
         if self
             .agent_action_registry
             .process_boundary_required(&pane.terminal_id, process_instance)
         {
-            runtime.drain_output_boundary().ok()?;
+            let pre_boundary_snapshot = capture_detection_snapshot(runtime)?;
+            let mut probe_status = self.agent_action_registry.poll_process_boundary_probe(
+                &pane.terminal_id,
+                process_instance,
+                pre_boundary_snapshot.pty_output_seq,
+            );
+            if probe_status == AgentActionBoundaryProbeStatus::Start {
+                match runtime.request_output_boundary() {
+                    Ok(request) => {
+                        self.agent_action_registry.start_process_boundary_probe(
+                            &pane.terminal_id,
+                            process_instance,
+                            request,
+                        );
+                        probe_status = self.agent_action_registry.poll_process_boundary_probe(
+                            &pane.terminal_id,
+                            process_instance,
+                            pre_boundary_snapshot.pty_output_seq,
+                        );
+                    }
+                    Err(_) => {
+                        self.agent_action_registry.defer_process_boundary_probe(
+                            &pane.terminal_id,
+                            process_instance,
+                            pre_boundary_snapshot.pty_output_seq,
+                        );
+                        return None;
+                    }
+                }
+            }
+            if probe_status != AgentActionBoundaryProbeStatus::Ready {
+                return None;
+            }
             if super::agents::runtime_agent_process_instance(runtime, expected_agent)
                 != Some(process_instance)
             {

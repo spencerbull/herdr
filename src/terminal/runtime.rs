@@ -499,8 +499,11 @@ impl TerminalRuntime {
         self.0.guarded_writes_supported()
     }
 
-    pub(crate) fn drain_output_boundary(&self) -> Result<(), crate::pty::actor::GuardedWriteError> {
-        self.0.drain_output_boundary()
+    pub(crate) fn request_output_boundary(
+        &self,
+    ) -> Result<crate::pty::actor::OutputBoundaryRequest, crate::pty::actor::GuardedWriteError>
+    {
+        self.0.request_output_boundary()
     }
 
     pub async fn send_paste(&self, text: String) -> Result<(), mpsc::error::SendError<Bytes>> {
@@ -638,6 +641,21 @@ impl TerminalRuntime {
     #[cfg(test)]
     pub(crate) fn test_emit_bytes_at_output_boundary(&self, bytes: Vec<u8>) {
         self.0.test_emit_bytes_at_output_boundary(bytes);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_hold_output_boundaries(&self) {
+        self.0.test_hold_output_boundaries();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_output_boundary_request_count(&self) -> usize {
+        self.0.test_output_boundary_request_count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_fail_pending_output_boundaries(&self) {
+        self.0.test_fail_pending_output_boundaries();
     }
 
     pub(crate) fn current_size(&self) -> (u16, u16) {

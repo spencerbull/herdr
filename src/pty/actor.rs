@@ -1,6 +1,26 @@
-use std::sync::Arc;
+use std::sync::{mpsc as std_mpsc, Arc};
 
 pub(crate) type GuardedWriteValidator = Arc<dyn Fn() -> bool + Send + Sync + 'static>;
+
+pub(crate) struct OutputBoundaryRequest {
+    reply: std_mpsc::Receiver<Result<(), GuardedWriteError>>,
+}
+
+impl OutputBoundaryRequest {
+    #[cfg(any(unix, test))]
+    pub(crate) fn new(reply: std_mpsc::Receiver<Result<(), GuardedWriteError>>) -> Self {
+        Self { reply }
+    }
+
+    pub(crate) fn poll(&self) -> Result<Option<()>, GuardedWriteError> {
+        match self.reply.try_recv() {
+            Ok(Ok(())) => Ok(Some(())),
+            Ok(Err(error)) => Err(error),
+            Err(std_mpsc::TryRecvError::Empty) => Ok(None),
+            Err(std_mpsc::TryRecvError::Disconnected) => Err(GuardedWriteError::Closed),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(
@@ -46,7 +66,7 @@ mod windows {
     use tokio::sync::mpsc;
     use tracing::{debug, warn};
 
-    use super::{GuardedWriteError, GuardedWriteValidator};
+    use super::{GuardedWriteError, GuardedWriteValidator, OutputBoundaryRequest};
 
     pub(crate) struct PtyReadResult {
         pub terminal_responses: Vec<Bytes>,
@@ -180,7 +200,9 @@ mod windows {
             false
         }
 
-        pub(crate) fn drain_output_boundary(&self) -> Result<(), GuardedWriteError> {
+        pub(crate) fn request_output_boundary(
+            &self,
+        ) -> Result<OutputBoundaryRequest, GuardedWriteError> {
             Err(GuardedWriteError::Io(
                 "guarded PTY output barriers are unavailable on Windows".to_string(),
             ))

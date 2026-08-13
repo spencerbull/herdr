@@ -12,6 +12,8 @@ use portable_pty::CommandBuilder;
 use portable_pty::{native_pty_system, PtySize};
 use ratatui::{layout::Rect, Frame};
 #[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+#[cfg(test)]
 use tokio::sync::watch;
 use tokio::sync::{mpsc, Notify};
 #[cfg(not(windows))]
@@ -22,8 +24,8 @@ use crate::detect::{Agent, AgentState};
 use crate::events::AppEvent;
 use crate::layout::PaneId;
 use crate::pty::actor::{
-    GuardedWriteError, GuardedWriteValidator, PtyIoActor, PtyIoActorConfig, PtyIoActorHandle,
-    PtyReadResult,
+    GuardedWriteError, GuardedWriteValidator, OutputBoundaryRequest, PtyIoActor, PtyIoActorConfig,
+    PtyIoActorHandle, PtyReadResult,
 };
 use crate::render_signal::RenderSignal;
 
@@ -1150,6 +1152,13 @@ pub struct PaneRuntime {
     test_replace_agent_before_guarded_write: AtomicBool,
     #[cfg(test)]
     test_output_boundary_bytes: Mutex<Option<Vec<u8>>>,
+    #[cfg(test)]
+    test_hold_output_boundaries: AtomicBool,
+    #[cfg(test)]
+    test_output_boundary_requests: AtomicUsize,
+    #[cfg(test)]
+    test_pending_output_boundaries:
+        Mutex<Vec<std::sync::mpsc::Sender<Result<(), GuardedWriteError>>>>,
     // Task handles for deterministic shutdown
     detect_handle: Option<tokio::task::AbortHandle>,
 }
@@ -1345,11 +1354,17 @@ impl PaneRuntimeIo {
         }
     }
 
-    fn drain_output_boundary(&self) -> Result<(), GuardedWriteError> {
+    fn request_output_boundary(&self) -> Result<OutputBoundaryRequest, GuardedWriteError> {
         match self {
-            PaneRuntimeIo::Actor(actor) => actor.drain_output_boundary(),
+            PaneRuntimeIo::Actor(actor) => actor.request_output_boundary(),
             #[cfg(test)]
-            PaneRuntimeIo::TestChannel { .. } => Ok(()),
+            PaneRuntimeIo::TestChannel { .. } => {
+                let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+                reply_tx
+                    .send(Ok(()))
+                    .map_err(|_| GuardedWriteError::Closed)?;
+                Ok(OutputBoundaryRequest::new(reply_rx))
+            }
         }
     }
 }
@@ -2157,6 +2172,12 @@ impl PaneRuntime {
             test_replace_agent_before_guarded_write: AtomicBool::new(false),
             #[cfg(test)]
             test_output_boundary_bytes: Mutex::new(None),
+            #[cfg(test)]
+            test_hold_output_boundaries: AtomicBool::new(false),
+            #[cfg(test)]
+            test_output_boundary_requests: AtomicUsize::new(0),
+            #[cfg(test)]
+            test_pending_output_boundaries: Mutex::new(Vec::new()),
             detect_handle: Some(detect_handle),
         })
     }
@@ -2736,6 +2757,12 @@ impl PaneRuntime {
             test_replace_agent_before_guarded_write: AtomicBool::new(false),
             #[cfg(test)]
             test_output_boundary_bytes: Mutex::new(None),
+            #[cfg(test)]
+            test_hold_output_boundaries: AtomicBool::new(false),
+            #[cfg(test)]
+            test_output_boundary_requests: AtomicUsize::new(0),
+            #[cfg(test)]
+            test_pending_output_boundaries: Mutex::new(Vec::new()),
             detect_handle,
         })
     }
@@ -3092,17 +3119,31 @@ impl PaneRuntime {
         self.io.guarded_writes_supported()
     }
 
-    pub(crate) fn drain_output_boundary(&self) -> Result<(), GuardedWriteError> {
+    pub(crate) fn request_output_boundary(
+        &self,
+    ) -> Result<OutputBoundaryRequest, GuardedWriteError> {
         #[cfg(test)]
-        if let Some(bytes) = self
-            .test_output_boundary_bytes
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
         {
-            self.test_process_pty_bytes(&bytes);
+            self.test_output_boundary_requests
+                .fetch_add(1, Ordering::Relaxed);
+            if let Some(bytes) = self
+                .test_output_boundary_bytes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+            {
+                self.test_process_pty_bytes(&bytes);
+            }
+            if self.test_hold_output_boundaries.load(Ordering::Relaxed) {
+                let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+                self.test_pending_output_boundaries
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(reply_tx);
+                return Ok(OutputBoundaryRequest::new(reply_rx));
+            }
         }
-        self.io.drain_output_boundary()
+        self.io.request_output_boundary()
     }
 
     pub async fn send_paste(&self, text: String) -> Result<(), mpsc::error::SendError<Bytes>> {
@@ -3269,6 +3310,29 @@ impl PaneRuntime {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(bytes);
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_hold_output_boundaries(&self) {
+        self.test_hold_output_boundaries
+            .store(true, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_output_boundary_request_count(&self) -> usize {
+        self.test_output_boundary_requests.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_fail_pending_output_boundaries(&self) {
+        for reply in self
+            .test_pending_output_boundaries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain(..)
+        {
+            let _ = reply.send(Err(GuardedWriteError::TimedOut));
+        }
+    }
+
     pub fn follow_cwd(&self) -> Option<std::path::PathBuf> {
         #[cfg(unix)]
         {
@@ -3386,6 +3450,9 @@ impl PaneRuntime {
                 test_agent_process_start_identity: Arc::new(AtomicU64::new(1)),
                 test_replace_agent_before_guarded_write: AtomicBool::new(false),
                 test_output_boundary_bytes: Mutex::new(None),
+                test_hold_output_boundaries: AtomicBool::new(false),
+                test_output_boundary_requests: AtomicUsize::new(0),
+                test_pending_output_boundaries: Mutex::new(Vec::new()),
                 detect_handle: Some(tokio::spawn(async {}).abort_handle()),
             },
             rx,
@@ -4048,6 +4115,9 @@ mod tests {
             test_agent_process_start_identity: Arc::new(AtomicU64::new(1)),
             test_replace_agent_before_guarded_write: AtomicBool::new(false),
             test_output_boundary_bytes: Mutex::new(None),
+            test_hold_output_boundaries: AtomicBool::new(false),
+            test_output_boundary_requests: AtomicUsize::new(0),
+            test_pending_output_boundaries: Mutex::new(Vec::new()),
             detect_handle: Some(tokio::spawn(async {}).abort_handle()),
         };
 
@@ -4084,6 +4154,9 @@ mod tests {
             test_agent_process_start_identity: Arc::new(AtomicU64::new(1)),
             test_replace_agent_before_guarded_write: AtomicBool::new(false),
             test_output_boundary_bytes: Mutex::new(None),
+            test_hold_output_boundaries: AtomicBool::new(false),
+            test_output_boundary_requests: AtomicUsize::new(0),
+            test_pending_output_boundaries: Mutex::new(Vec::new()),
             detect_handle: Some(tokio::spawn(async {}).abort_handle()),
         };
 

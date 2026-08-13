@@ -73,6 +73,31 @@ class DocsTranslationParityTests(unittest.TestCase):
             self.assertIn(f"{root / 'ja' / 'guide.mdx'}: missing translation file", errors)
             self.assertIn(f"{root / 'ja' / 'old.mdx'}: no matching English doc", errors)
 
+    def test_parity_reports_missing_required_api_literal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "ja").mkdir()
+            (root / "zh-cn").mkdir()
+            source = "# Automation\n\nUse `agent.perform_action`.\n"
+            (root / "agent-automation.mdx").write_text(source, encoding="utf-8")
+            (root / "ja" / "agent-automation.mdx").write_text(
+                "# 自動化\n\nAPI を使用します。\n",
+                encoding="utf-8",
+            )
+            (root / "zh-cn" / "agent-automation.mdx").write_text(
+                "# 自动化\n\n使用 `agent.perform_action`。\n",
+                encoding="utf-8",
+            )
+
+            errors = check_docs_translation_parity(root)
+
+            self.assertEqual(len(errors), 1)
+            self.assertIn("ja/agent-automation.mdx", errors[0])
+            self.assertIn(
+                "expected 1 occurrences of required shared literal 'agent.perform_action'",
+                errors[0],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

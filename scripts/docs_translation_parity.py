@@ -6,6 +6,9 @@ from pathlib import Path
 
 
 DEFAULT_LOCALES = ("ja", "zh-cn")
+REQUIRED_SHARED_LITERALS = {
+    "agent-automation.mdx": ("agent.perform_action",),
+}
 
 
 def heading_outline(path: Path) -> list[int]:
@@ -74,12 +77,21 @@ def check_docs_translation_parity(docs_root: Path, locales: tuple[str, ...] = DE
                 continue
 
             translated_outline = heading_outline(translated)
-            if translated_outline == source_outline:
-                continue
+            if translated_outline != source_outline:
+                errors.append(
+                    format_outline_error(source, translated, source_outline, translated_outline)
+                )
 
-            errors.append(
-                format_outline_error(source, translated, source_outline, translated_outline)
-            )
+            source_text = source.read_text(encoding="utf-8")
+            translated_text = translated.read_text(encoding="utf-8")
+            for literal in REQUIRED_SHARED_LITERALS.get(source.name, ()):
+                expected_count = source_text.count(literal)
+                translated_count = translated_text.count(literal)
+                if expected_count != translated_count:
+                    errors.append(
+                        f"{translated}: expected {expected_count} occurrences of required shared "
+                        f"literal {literal!r} from {source}, found {translated_count}"
+                    )
 
     return errors
 
@@ -110,7 +122,7 @@ def format_counts(levels: list[int]) -> str:
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Check localized docs have the same heading outline as English docs."
+        description="Check localized docs preserve the required structure and API literals."
     )
     parser.add_argument(
         "--docs-root",
@@ -133,7 +145,7 @@ def main(argv: list[str] | None = None) -> int:
     errors = check_docs_translation_parity(args.docs_root, locales)
 
     if errors:
-        print("error: localized docs heading outlines differ from English docs", file=sys.stderr)
+        print("error: localized docs differ from required English parity", file=sys.stderr)
         for error in errors:
             print(f"- {error}", file=sys.stderr)
         return 1
