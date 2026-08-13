@@ -218,6 +218,45 @@ fn send_request(socket_path: &Path, json: &str) -> serde_json::Value {
     reader.read_json_line(Duration::from_secs(5))
 }
 
+#[test]
+fn agent_order_api_round_trips_and_persists_the_shared_ui_setting() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+
+    let child = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let initial = send_request(
+        &socket_path,
+        r#"{"id":"order-get","method":"agent.order.get","params":{}}"#,
+    );
+    assert_eq!(initial["result"]["type"], "agent_order");
+    assert_eq!(initial["result"]["order"], "grouped");
+
+    let changed = send_request(
+        &socket_path,
+        r#"{"id":"order-set","method":"agent.order.set","params":{"order":"priority"}}"#,
+    );
+    assert_eq!(changed["result"]["type"], "agent_order");
+    assert_eq!(changed["result"]["order"], "priority");
+
+    let reread = send_request(
+        &socket_path,
+        r#"{"id":"order-reread","method":"agent.order.get","params":{}}"#,
+    );
+    assert_eq!(reread["result"]["order"], "priority");
+    assert!(
+        fs::read_to_string(config_home.join("herdr-dev/config.toml"))
+            .unwrap()
+            .contains("agent_panel_sort = \"priority\"")
+    );
+
+    cleanup_spawned_herdr(child, base);
+}
+
 fn open_subscription(socket_path: &Path, json: &str) -> JsonLineReader {
     let mut reader = JsonLineReader::connect(socket_path);
     reader.send_line(json);

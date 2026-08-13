@@ -1222,6 +1222,24 @@
     },
     "request": {
       "$defs": {
+        "AgentOrder": {
+          "enum": [
+            "grouped",
+            "priority"
+          ],
+          "type": "string"
+        },
+        "AgentOrderSetParams": {
+          "properties": {
+            "order": {
+              "$ref": "#/schemas/request/$defs/AgentOrder"
+            }
+          },
+          "required": [
+            "order"
+          ],
+          "type": "object"
+        },
         "AgentPerformActionParams": {
           "additionalProperties": false,
           "properties": {
@@ -4964,6 +4982,38 @@
         {
           "properties": {
             "method": {
+              "const": "agent.order.get",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/EmptyParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.order.set",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentOrderSetParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "agent.get",
               "type": "string"
             },
@@ -6443,6 +6493,13 @@
             "local_override_shadowing_remote"
           ],
           "type": "object"
+        },
+        "AgentOrder": {
+          "enum": [
+            "grouped",
+            "priority"
+          ],
+          "type": "string"
         },
         "AgentSessionInfo": {
           "properties": {
@@ -9135,6 +9192,22 @@
               "required": [
                 "type",
                 "agents"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "order": {
+                  "$ref": "#/schemas/success_response/$defs/AgentOrder"
+                },
+                "type": {
+                  "const": "agent_order",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "order"
               ],
               "type": "object"
             },

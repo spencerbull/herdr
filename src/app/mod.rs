@@ -3693,12 +3693,57 @@ mod tests {
         let mut app = test_app();
         assert_eq!(app.state.agent_panel_sort, state::AgentPanelSort::Spaces);
 
-        app.save_agent_panel_sort(state::AgentPanelSort::Priority);
+        assert!(app.save_agent_panel_sort(state::AgentPanelSort::Priority));
 
         assert_eq!(app.state.agent_panel_sort, state::AgentPanelSort::Priority);
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("agent_panel_sort = \"priority\""));
         assert!(app.state.config_diagnostic.is_none());
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn agent_order_api_reads_persists_and_applies_the_shared_ui_setting() {
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("agent-order-api");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "onboarding = false\n[ui]\nagent_panel_sort = \"spaces\"\n",
+        )
+        .unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        let mut app = test_app();
+        let get: crate::api::schema::SuccessResponse =
+            serde_json::from_str(&app.handle_agent_order_get("order-get".into())).unwrap();
+        assert!(matches!(
+            get.result,
+            crate::api::schema::ResponseResult::AgentOrder {
+                order: crate::api::schema::AgentOrder::Grouped
+            }
+        ));
+
+        let set: crate::api::schema::SuccessResponse =
+            serde_json::from_str(&app.handle_agent_order_set(
+                "order-set".into(),
+                crate::api::schema::AgentOrderSetParams {
+                    order: crate::api::schema::AgentOrder::Priority,
+                },
+            ))
+            .unwrap();
+        assert!(matches!(
+            set.result,
+            crate::api::schema::ResponseResult::AgentOrder {
+                order: crate::api::schema::AgentOrder::Priority
+            }
+        ));
+        assert_eq!(app.state.agent_panel_sort, state::AgentPanelSort::Priority);
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("agent_panel_sort = \"priority\""));
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());

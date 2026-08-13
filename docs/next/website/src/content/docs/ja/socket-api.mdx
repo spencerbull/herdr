@@ -102,7 +102,7 @@ herdr pane read w1:p2 --source recent --lines 50
 | ペイン | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.rename`、`pane.send_text`、`pane.send_keys`、`pane.send_input`、`pane.read`、`pane.graphics.info`、`pane.graphics.set`、`pane.graphics.clear`、`pane.graphics.stream`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.wait_for_output` |
 | ポップアップ | `popup.close` |
 | レイアウト | `layout.export`、`layout.apply`、`layout.set_split_ratio` |
-| エージェント | `agent.list`、`agent.get`、`agent.read`、`agent.explain`、`agent.send_keys`、`agent.prompt`、`agent.wait`、`agent.rename`、`agent.focus`、`agent.start` |
+| エージェント | `agent.list`、`agent.order.get`、`agent.order.set`、`agent.get`、`agent.read`、`agent.explain`、`agent.send_keys`、`agent.prompt`、`agent.wait`、`agent.rename`、`agent.focus`、`agent.start` |
 | イベント | `events.subscribe`、`events.wait` |
 | インテグレーション | `integration.install`、`integration.uninstall` |
 | プラグイン | `plugin.link`、`plugin.list`、`plugin.unlink`、`plugin.enable`、`plugin.disable`、`plugin.action.list`、`plugin.action.invoke`、`plugin.log.list`、`plugin.pane.open`、`plugin.pane.focus`、`plugin.pane.close` |
@@ -300,6 +300,17 @@ Worktree メソッドは Git チェックアウトを Herdr ワークスペー�
 worktree コマンドはライフサイクルイベントも発行します。`worktree.create` は `workspace.created`、`tab.created`、`pane.created`、`worktree.created` を発行します。`worktree.open` は `worktree.opened` を発行し、新しい Herdr ワークスペースを開いた場合はワークスペース/タブ/ペインの作成イベントも発行します。`worktree.remove` は `worktree.removed` を発行し、リンクされたワークスペースがまだ開いている場合は `workspace.closed` も発行します。
 
 リンクされた worktree ワークスペースが開いている親ワークスペースを `workspace.close` で閉じるには、params に `"close_group": true` が必要です。明示的なグループクローズ指定がない場合は `workspace_group_close_required` を返します。明示的なグループクローズは、閉じた各ワークスペースについて `workspace.closed` イベントを 1 件ずつ発行します。
+
+## エージェントの並び順
+
+Herdr の組み込み Agents ビューと API クライアントで共有する永続的な並び順を取得または設定します。公開される値は `grouped` と `priority` です。`grouped` は永続設定 `ui.agent_panel_sort = "spaces"` に対応します。
+
+```json
+{"id":"order_get","method":"agent.order.get","params":{}}
+{"id":"order_set","method":"agent.order.set","params":{"order":"priority"}}
+```
+
+`agent.order.set` は冪等で、設定を永続化し、レスポンスを返す前に実行中の Herdr UI へ適用します。クライアントは通常のエージェントスナップショット更新とともに `agent.order.get` をポーリングすることで、どちらの UI から行われた変更も検出できます。
 
 ## エージェントビューのクエリ
 

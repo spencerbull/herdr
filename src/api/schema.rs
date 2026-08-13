@@ -105,6 +105,10 @@ pub enum Method {
     TabClose(TabTarget),
     #[serde(rename = "agent.list")]
     AgentList(EmptyParams),
+    #[serde(rename = "agent.order.get")]
+    AgentOrderGet(EmptyParams),
+    #[serde(rename = "agent.order.set")]
+    AgentOrderSet(AgentOrderSetParams),
     #[serde(rename = "agent.get")]
     AgentGet(AgentTarget),
     #[serde(rename = "agent.read")]

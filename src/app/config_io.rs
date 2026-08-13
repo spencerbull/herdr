@@ -105,7 +105,10 @@ impl App {
         }
     }
 
-    pub(super) fn save_agent_panel_sort(&mut self, sort: crate::app::state::AgentPanelSort) {
+    pub(super) fn save_agent_panel_sort(
+        &mut self,
+        sort: crate::app::state::AgentPanelSort,
+    ) -> bool {
         let value = match sort {
             crate::app::state::AgentPanelSort::Spaces => {
                 crate::config::AgentPanelSortConfig::Spaces.as_str()
@@ -123,6 +126,9 @@ impl App {
             )
         }) {
             self.apply_config_from_disk(false);
+            true
+        } else {
+            false
         }
     }
 }

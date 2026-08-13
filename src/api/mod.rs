@@ -43,6 +43,7 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
             | Method::LayoutApply(_)
             | Method::LayoutSetSplitRatio(_)
             | Method::AgentRename(_)
+            | Method::AgentOrderSet(_)
             | Method::AgentViewSet(_)
             | Method::AgentViewClear(_)
             | Method::AgentFocus(_)

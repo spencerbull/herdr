@@ -412,6 +412,8 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::TabMove(_) => "tab.move",
         Method::TabClose(_) => "tab.close",
         Method::AgentList(_) => "agent.list",
+        Method::AgentOrderGet(_) => "agent.order.get",
+        Method::AgentOrderSet(_) => "agent.order.set",
         Method::AgentGet(_) => "agent.get",
         Method::AgentRead(_) => "agent.read",
         Method::AgentExplain(_) => "agent.explain",

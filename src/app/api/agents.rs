@@ -3,8 +3,9 @@ use std::time::Duration;
 use bytes::Bytes;
 
 use crate::api::schema::{
-    AgentPerformActionParams, AgentPromptParams, AgentRenameParams, AgentSendKeysParams,
-    AgentStartParams, AgentTarget, PaneReadResult, ResponseResult,
+    AgentOrder, AgentOrderSetParams, AgentPerformActionParams, AgentPromptParams,
+    AgentRenameParams, AgentSendKeysParams, AgentStartParams, AgentTarget, PaneReadResult,
+    ResponseResult,
 };
 use crate::app::App;
 
@@ -18,6 +19,39 @@ impl App {
             id,
             ResponseResult::AgentList {
                 agents: self.collect_agent_infos(),
+            },
+        )
+    }
+
+    pub(crate) fn handle_agent_order_get(&mut self, id: String) -> String {
+        encode_success(
+            id,
+            ResponseResult::AgentOrder {
+                order: agent_order_from_state(self.state.agent_panel_sort),
+            },
+        )
+    }
+
+    pub(crate) fn handle_agent_order_set(
+        &mut self,
+        id: String,
+        params: AgentOrderSetParams,
+    ) -> String {
+        let order = match params.order {
+            AgentOrder::Grouped => crate::app::state::AgentPanelSort::Spaces,
+            AgentOrder::Priority => crate::app::state::AgentPanelSort::Priority,
+        };
+        if order != self.state.agent_panel_sort && !self.save_agent_panel_sort(order) {
+            return encode_error(
+                id,
+                "config_write_failed",
+                "could not persist agent ordering",
+            );
+        }
+        encode_success(
+            id,
+            ResponseResult::AgentOrder {
+                order: agent_order_from_state(self.state.agent_panel_sort),
             },
         )
     }
@@ -304,6 +338,13 @@ impl App {
                 pane_id: capability.pane_id,
             },
         )
+    }
+}
+
+fn agent_order_from_state(order: crate::app::state::AgentPanelSort) -> AgentOrder {
+    match order {
+        crate::app::state::AgentPanelSort::Spaces => AgentOrder::Grouped,
+        crate::app::state::AgentPanelSort::Priority => AgentOrder::Priority,
     }
 }
 

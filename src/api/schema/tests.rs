@@ -410,6 +410,28 @@ fn agent_view_requests_round_trip() {
 }
 
 #[test]
+fn agent_order_requests_round_trip() {
+    let get = Request {
+        id: "order-get".into(),
+        method: Method::AgentOrderGet(EmptyParams::default()),
+    };
+    let get_json = serde_json::to_value(&get).unwrap();
+    assert_eq!(get_json["method"], "agent.order.get");
+    assert_eq!(serde_json::from_value::<Request>(get_json).unwrap(), get);
+
+    let set = Request {
+        id: "order-set".into(),
+        method: Method::AgentOrderSet(AgentOrderSetParams {
+            order: AgentOrder::Priority,
+        }),
+    };
+    let set_json = serde_json::to_value(&set).unwrap();
+    assert_eq!(set_json["method"], "agent.order.set");
+    assert_eq!(set_json["params"]["order"], "priority");
+    assert_eq!(serde_json::from_value::<Request>(set_json).unwrap(), set);
+}
+
+#[test]
 fn unknown_method_is_rejected() {
     let json = r#"{"id":"req_1","method":"nope","params":{}}"#;
     let err = serde_json::from_str::<Request>(json)
