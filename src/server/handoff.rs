@@ -23,7 +23,9 @@ const READY_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(unix)]
 const OWNED_ACK_TIMEOUT: Duration = Duration::from_millis(500);
 #[cfg(unix)]
-pub(crate) const MAX_FDS_PER_HANDOFF: usize = 64;
+// Keep the one-message handoff comfortably below the supported kernels' SCM_RIGHTS
+// limits (Linux: 253, macOS: 512) while allowing known large sessions.
+pub(crate) const MAX_FDS_PER_HANDOFF: usize = 128;
 #[cfg(unix)]
 pub(crate) const MAX_REPLAY_BYTES_PER_PANE: usize = 8 * 1024;
 #[cfg(unix)]
@@ -520,5 +522,49 @@ mod tests {
             serde_json::from_value(value).expect("an older manifest should still load");
 
         assert!(older.api_window_title.is_none());
+    }
+
+    #[test]
+    fn a_handoff_transfers_the_current_79_pane_scale() {
+        const CURRENT_PANE_SCALE: usize = 79;
+
+        let (mut source, mut import) = UnixStream::pair().expect("socket pair should open");
+        let source_fd = std::fs::File::open("/dev/null").expect("source fd should open");
+        let fds = vec![source_fd.as_raw_fd(); CURRENT_PANE_SCALE];
+        let receiver = std::thread::spawn(move || {
+            let received = recv_fds(&import, CURRENT_PANE_SCALE)
+                .expect("current-scale fd transfer should succeed");
+            let received_count = received.len();
+            for fd in received {
+                let _ = unsafe { libc::close(fd) };
+            }
+            import
+                .write_all(b"restored\n")
+                .expect("import should acknowledge restored runtimes");
+            received_count
+        });
+
+        send_fds_and_wait_restored(&mut source, &fds)
+            .expect("current-scale handoff should succeed");
+        assert_eq!(
+            receiver.join().expect("receiver should finish"),
+            CURRENT_PANE_SCALE
+        );
+    }
+
+    #[test]
+    fn a_handoff_rejects_more_than_the_bounded_fd_capacity() {
+        let (mut source, _import) = UnixStream::pair().expect("socket pair should open");
+        let source_fd = std::fs::File::open("/dev/null").expect("source fd should open");
+        let fds = vec![source_fd.as_raw_fd(); MAX_FDS_PER_HANDOFF + 1];
+
+        let error = send_fds_and_wait_restored(&mut source, &fds)
+            .expect_err("an over-capacity handoff should fail before transfer");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            format!("handoff supports at most {MAX_FDS_PER_HANDOFF} pane file descriptors at once")
+        );
     }
 }
