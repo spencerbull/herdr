@@ -3750,6 +3750,47 @@ mod tests {
     }
 
     #[test]
+    fn agent_order_api_applies_requested_sort_with_unrelated_invalid_ui_bounds() {
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("agent-order-api-invalid-ui-bounds");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "onboarding = false\n[ui]\nsidebar_min_width = 90\nsidebar_max_width = 20\nagent_panel_sort = \"spaces\"\n",
+        )
+        .unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        let mut app = test_app();
+        assert_eq!(app.state.agent_panel_sort, state::AgentPanelSort::Spaces);
+
+        let set: crate::api::schema::SuccessResponse =
+            serde_json::from_str(&app.handle_agent_order_set(
+                "order-set-invalid-ui-bounds".into(),
+                crate::api::schema::AgentOrderSetParams {
+                    order: crate::api::schema::AgentOrder::Priority,
+                },
+            ))
+            .unwrap();
+
+        assert!(matches!(
+            set.result,
+            crate::api::schema::ResponseResult::AgentOrder {
+                order: crate::api::schema::AgentOrder::Priority
+            }
+        ));
+        assert_eq!(app.state.agent_panel_sort, state::AgentPanelSort::Priority);
+        assert_eq!(app.state.agent_panel_scroll, 0);
+        assert!(app.state.config_diagnostic.is_some());
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("agent_panel_sort = \"priority\""));
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
     fn reload_config_keeps_current_state_on_invalid_toml() {
         let _guard = config_env_lock().lock().unwrap();
         let path = temp_config_path("reload-config-invalid-toml");

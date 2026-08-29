@@ -126,6 +126,11 @@ impl App {
             )
         }) {
             self.apply_config_from_disk(false);
+            // This action owns the requested presentation state. Apply that
+            // narrow value even when an unrelated invalid [ui] setting makes
+            // the general config reload retain the previous section.
+            self.state.agent_panel_sort = sort;
+            self.state.agent_panel_scroll = 0;
             true
         } else {
             false

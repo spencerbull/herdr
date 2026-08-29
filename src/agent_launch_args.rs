@@ -152,6 +152,14 @@ fn dropped_options(agent: &str) -> &'static [&'static str] {
         "kimi" | "kilo" => &["--session"],
         "mastracode" => &["--thread"],
         "agy" => &["--conversation"],
+        "qwen" => &[
+            "--resume",
+            "--continue",
+            "-p",
+            "--prompt",
+            "-i",
+            "--prompt-interactive",
+        ],
         _ => &[],
     }
 }
@@ -209,6 +217,19 @@ mod tests {
             replayable("omp", &args(&["--model=opus", "--resume=abc123"])),
             args(&["--model=opus"])
         );
+        assert_eq!(
+            replayable(
+                "qwen",
+                &args(&[
+                    "--model",
+                    "qwen3-coder-plus",
+                    "--resume",
+                    "abc123",
+                    "--continue",
+                ])
+            ),
+            args(&["--model", "qwen3-coder-plus"])
+        );
     }
 
     #[test]
@@ -256,6 +277,17 @@ mod tests {
                 &args(&["--always-approve", "--", "trailing prompt"])
             ),
             args(&["--always-approve"])
+        );
+        assert_eq!(
+            replayable("qwen", &args(&["-p", "summarize this repo"])),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            replayable(
+                "qwen",
+                &args(&["--prompt-interactive", "fix the failing test"])
+            ),
+            Vec::<String>::new()
         );
     }
 
