@@ -464,7 +464,11 @@ fn recv_fd_batch(stream: &UnixStream, wanted: usize) -> io::Result<Vec<RawFd>> {
         iov_base: byte.as_mut_ptr() as *mut libc::c_void,
         iov_len: byte.len(),
     }];
-    let fd_bytes = wanted * std::mem::size_of::<RawFd>();
+    // Always receive a complete platform-sized message before validating the
+    // expected count. Darwin installs every received descriptor before copying
+    // ancillary data to userspace; a short buffer can lose the descriptor
+    // numbers needed for cleanup, even when MSG_CTRUNC is returned.
+    let fd_bytes = MAX_FDS_PER_RECEIVE * std::mem::size_of::<RawFd>();
     let mut control = vec![0u8; unsafe { libc::CMSG_SPACE(fd_bytes as u32) as usize }];
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_iov = iov.as_mut_ptr();
@@ -501,8 +505,8 @@ fn recv_fd_batch(stream: &UnixStream, wanted: usize) -> io::Result<Vec<RawFd>> {
         }
     }
 
-    // Truncation means the kernel closed the descriptors that did not fit, so
-    // the batch is unrecoverable rather than merely short.
+    // A truncated control message is unrecoverable rather than merely short.
+    // The full-sized buffer above prevents truncating a valid SCM_RIGHTS batch.
     if msg.msg_flags & libc::MSG_CTRUNC != 0 {
         close_raw_fds(&out);
         return Err(io::Error::other("handoff fd control message was truncated"));
@@ -588,7 +592,7 @@ mod tests {
     }
 
     #[test]
-    fn truncated_batch_closes_current_and_preceding_fds() {
+    fn excess_batch_closes_current_and_preceding_fds() {
         let (sender, receiver) = UnixStream::pair().unwrap();
         let (peer, transferred) = fd_transfer_pair();
         send_fd_batch(&sender, &[transferred.as_raw_fd(); 64]).unwrap();
@@ -597,21 +601,28 @@ mod tests {
         drop(sender);
 
         let err = recv_fds(&receiver, 66).unwrap_err();
-        assert_eq!(err.to_string(), "handoff fd control message was truncated");
+        assert_eq!(
+            err.to_string(),
+            "handoff fd message carried 6 descriptors, expected at most 2"
+        );
         assert_transferred_fds_closed(peer);
     }
 
     #[test]
-    fn excess_fds_in_control_padding_are_closed() {
+    fn excess_fds_beyond_expected_count_are_closed() {
         let (sender, receiver) = UnixStream::pair().unwrap();
         let (peer, transferred) = fd_transfer_pair();
         send_fd_batch(&sender, &[transferred.as_raw_fd(); 2]).unwrap();
         drop(transferred);
         drop(sender);
 
-        // Some platforms fit a second fd in CMSG_SPACE's alignment padding;
-        // others truncate it. Both must reject the batch and close all copies.
-        assert!(recv_fds(&receiver, 1).is_err());
+        // Receive all descriptors before rejecting the count, so even platforms
+        // that install truncated rights cannot lose fd numbers during cleanup.
+        let err = recv_fds(&receiver, 1).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "handoff fd message carried 2 descriptors, expected at most 1"
+        );
         assert_transferred_fds_closed(peer);
     }
 
