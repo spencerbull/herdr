@@ -27,6 +27,10 @@ const OWNED_ACK_TIMEOUT: Duration = Duration::from_millis(500);
 // batch stays well below both limits and the number of panes stays unbounded.
 #[cfg(unix)]
 const FDS_PER_MESSAGE: usize = 64;
+// Legacy senders put all descriptors in one message. Allow either platform's
+// single-message limit on receive, without allocating for an unbounded manifest.
+#[cfg(unix)]
+const MAX_FDS_PER_RECEIVE: usize = 254;
 #[cfg(unix)]
 pub(crate) const MAX_REPLAY_BYTES_PER_PANE: usize = 8 * 1024;
 #[cfg(unix)]
@@ -430,7 +434,7 @@ fn close_raw_fds(fds: &[RawFd]) {
 fn recv_fds(stream: &UnixStream, expected: usize) -> io::Result<Vec<RawFd>> {
     let mut out: Vec<RawFd> = Vec::with_capacity(expected);
     while out.len() < expected {
-        let wanted = (expected - out.len()).min(FDS_PER_MESSAGE);
+        let wanted = (expected - out.len()).min(MAX_FDS_PER_RECEIVE);
         let batch = match recv_fd_batch(stream, wanted) {
             Ok(batch) => batch,
             Err(err) => {
@@ -528,6 +532,128 @@ pub(crate) fn log_import_result(panes: usize) {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use std::os::fd::{FromRawFd, OwnedFd};
+
+    fn fd_transfer_pair() -> (UnixStream, UnixStream) {
+        let (peer, transferred) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        (peer, transferred)
+    }
+
+    fn assert_transferred_fds_closed(mut peer: UnixStream) {
+        // EOF proves that every transferred copy was closed, without relying on
+        // process-wide fd counts or fd numbers that parallel tests can reuse.
+        assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+    }
+
+    fn assert_fd_transfer(count: usize, legacy: bool) {
+        let (sender, receiver) = UnixStream::pair().unwrap();
+        let (mut peer, transferred) = fd_transfer_pair();
+        let fds = vec![transferred.as_raw_fd(); count];
+        if legacy {
+            send_fd_batch(&sender, &fds).unwrap();
+        } else {
+            send_fds(&sender, &fds).unwrap();
+        }
+        drop(transferred);
+        drop(sender);
+        let received: Vec<OwnedFd> = recv_fds(&receiver, count)
+            .unwrap()
+            .into_iter()
+            .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
+            .collect();
+        assert_eq!(received.len(), count);
+        for fd in received {
+            UnixStream::from(fd).write_all(b"P").unwrap();
+        }
+        let mut data = vec![0; count];
+        peer.read_exact(&mut data).unwrap();
+        assert_eq!(data, vec![b'P'; count]);
+        assert_transferred_fds_closed(peer);
+    }
+
+    #[test]
+    fn receives_legacy_single_message_with_69_fds() {
+        assert_fd_transfer(69, true);
+    }
+
+    #[test]
+    fn receives_legacy_single_message_at_linux_fd_limit() {
+        assert_fd_transfer(253, true);
+    }
+
+    #[test]
+    fn receives_modern_batches_beyond_single_message_limit() {
+        assert_fd_transfer(259, false);
+    }
+
+    #[test]
+    fn truncated_batch_closes_current_and_preceding_fds() {
+        let (sender, receiver) = UnixStream::pair().unwrap();
+        let (peer, transferred) = fd_transfer_pair();
+        send_fd_batch(&sender, &[transferred.as_raw_fd(); 64]).unwrap();
+        send_fd_batch(&sender, &[transferred.as_raw_fd(); 6]).unwrap();
+        drop(transferred);
+        drop(sender);
+
+        let err = recv_fds(&receiver, 66).unwrap_err();
+        assert_eq!(err.to_string(), "handoff fd control message was truncated");
+        assert_transferred_fds_closed(peer);
+    }
+
+    #[test]
+    fn excess_fds_in_control_padding_are_closed() {
+        let (sender, receiver) = UnixStream::pair().unwrap();
+        let (peer, transferred) = fd_transfer_pair();
+        send_fd_batch(&sender, &[transferred.as_raw_fd(); 2]).unwrap();
+        drop(transferred);
+        drop(sender);
+
+        // Some platforms fit a second fd in CMSG_SPACE's alignment padding;
+        // others truncate it. Both must reject the batch and close all copies.
+        assert!(recv_fds(&receiver, 1).is_err());
+        assert_transferred_fds_closed(peer);
+    }
+
+    #[test]
+    fn eof_closes_preceding_fds() {
+        let (sender, receiver) = UnixStream::pair().unwrap();
+        let (peer, transferred) = fd_transfer_pair();
+        send_fd_batch(&sender, &[transferred.as_raw_fd()]).unwrap();
+        drop(transferred);
+        drop(sender);
+
+        let err = recv_fds(&receiver, 2).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert_transferred_fds_closed(peer);
+    }
+
+    #[test]
+    fn missing_rights_closes_preceding_fds() {
+        let (mut sender, receiver) = UnixStream::pair().unwrap();
+        let (peer, transferred) = fd_transfer_pair();
+        send_fd_batch(&sender, &[transferred.as_raw_fd()]).unwrap();
+        sender.write_all(b"F").unwrap();
+        drop(transferred);
+        drop(sender);
+
+        let err = recv_fds(&receiver, 2).unwrap_err();
+        assert_eq!(err.to_string(), "handoff fd message missing SCM_RIGHTS");
+        assert_transferred_fds_closed(peer);
+    }
+
+    #[test]
+    fn recvmsg_error_closes_preceding_fds() {
+        let (sender, receiver) = UnixStream::pair().unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        let (peer, transferred) = fd_transfer_pair();
+        send_fd_batch(&sender, &[transferred.as_raw_fd()]).unwrap();
+        drop(transferred);
+
+        let err = recv_fds(&receiver, 2).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        assert_transferred_fds_closed(peer);
+    }
 
     fn empty_snapshot() -> crate::persist::SessionSnapshot {
         crate::persist::SessionSnapshot {
